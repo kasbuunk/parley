@@ -14,6 +14,11 @@
 //!   PARLEY_ALLOWED        comma-separated user IDs allowed to invite the bot
 //!   PARLEY_DATA_DIR       default <data dir>/parley
 //!
+//! Verification: start "Verify" on @agent in Element. The bot accepts
+//! requests from people on the allow list and prints the emoji to its log.
+//! The bot confirms its side by itself; *you* are the check: compare the log
+//! with what Element shows, and only press "They match" if they do.
+//!
 //! State lives in PARLEY_DATA_DIR: `session.json` (access token, device ID)
 //! and `store/` (encrypted SQLite with the bot's encryption keys). Losing the
 //! store means losing the keys: delete both and log in again as a new device.
@@ -21,14 +26,22 @@
 use std::{env, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
+use futures_util::StreamExt;
 use matrix_sdk::{
     Client, Room, RoomState,
     authentication::matrix::MatrixSession,
     config::SyncSettings,
-    encryption::CrossSigningResetAuthType,
+    encryption::{
+        CrossSigningResetAuthType,
+        verification::{
+            SasState, SasVerification, Verification, VerificationRequest,
+            VerificationRequestState, format_emojis,
+        },
+    },
     ruma::{
         OwnedUserId,
         api::client::uiaa,
+        events::key::verification::request::ToDeviceKeyVerificationRequestEvent,
         events::room::{
             member::StrippedRoomMemberEvent,
             message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
@@ -113,6 +126,23 @@ async fn main() -> Result<()> {
         async move { on_invite(ev, client, room, &allowed).await }
     });
     client.add_event_handler(on_message);
+    let allowed = config.allowed.clone();
+    client.add_event_handler(move |ev: ToDeviceKeyVerificationRequestEvent, client: Client| {
+        let allowed = allowed.clone();
+        async move {
+            if !allowed.contains(&ev.sender) {
+                println!("ignoring verification request from {}", ev.sender);
+                return;
+            }
+            if let Some(request) = client
+                .encryption()
+                .get_verification_request(&ev.sender, &ev.content.transaction_id)
+                .await
+            {
+                tokio::spawn(handle_verification_request(request));
+            }
+        }
+    });
 
     println!("listening");
     client.sync(SyncSettings::default().token(response.next_batch)).await?;
@@ -190,11 +220,73 @@ async fn on_message(ev: OriginalSyncRoomMessageEvent, room: Room, client: Client
     if room.state() != RoomState::Joined || Some(ev.sender.as_ref()) == client.user_id() {
         return;
     }
+    if let MessageType::VerificationRequest(_) = &ev.content.msgtype {
+        // Element verifies a *user* through a message in a room. The bot only
+        // sees rooms it was invited to by allowed people, so no extra check.
+        if let Some(request) =
+            client.encryption().get_verification_request(&ev.sender, &ev.event_id).await
+        {
+            tokio::spawn(handle_verification_request(request));
+        }
+        return;
+    }
     let MessageType::Text(text) = &ev.content.msgtype else { return };
     println!("[{}] {}: {}", room.room_id(), ev.sender, text.body);
     let reply = RoomMessageEventContent::text_plain(format!("echo: {}", text.body));
     if let Err(e) = room.send(reply).await {
         eprintln!("send failed: {e}");
+    }
+}
+
+/// Accept a verification request and drive it through emoji (SAS) comparison.
+async fn handle_verification_request(request: VerificationRequest) {
+    println!("verification requested by {}", request.other_user_id());
+    if let Err(e) = request.accept().await {
+        eprintln!("could not accept verification: {e}");
+        return;
+    }
+    let mut changes = request.changes();
+    while let Some(state) = changes.next().await {
+        match state {
+            VerificationRequestState::Transitioned { verification: Verification::SasV1(sas) } => {
+                handle_sas(sas).await;
+                break;
+            }
+            VerificationRequestState::Done | VerificationRequestState::Cancelled(_) => break,
+            _ => {}
+        }
+    }
+}
+
+async fn handle_sas(sas: SasVerification) {
+    if let Err(e) = sas.accept().await {
+        eprintln!("could not accept SAS: {e}");
+        return;
+    }
+    let mut changes = sas.changes();
+    while let Some(state) = changes.next().await {
+        match state {
+            SasState::KeysExchanged { emojis: Some(emojis), .. } => {
+                println!(
+                    "\nVERIFY with {} {}: compare with Element, press \"They match\" only if equal:\n{}\n",
+                    sas.other_device().user_id(),
+                    sas.other_device().device_id(),
+                    format_emojis(emojis.emojis)
+                );
+                if let Err(e) = sas.confirm().await {
+                    eprintln!("could not confirm: {e}");
+                }
+            }
+            SasState::Done { .. } => {
+                println!("verified {} {}", sas.other_device().user_id(), sas.other_device().device_id());
+                break;
+            }
+            SasState::Cancelled(info) => {
+                println!("verification cancelled: {}", info.reason());
+                break;
+            }
+            _ => {}
+        }
     }
 }
 
