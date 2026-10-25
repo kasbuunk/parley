@@ -57,9 +57,12 @@ use matrix_sdk::{
         OwnedUserId,
         api::{client::uiaa, error::ErrorKind},
         events::key::verification::request::ToDeviceKeyVerificationRequestEvent,
+        events::relation::Thread,
         events::room::{
             member::StrippedRoomMemberEvent,
-            message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
+            message::{
+                MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
+            },
         },
     },
 };
@@ -328,10 +331,42 @@ async fn on_message(
     let MessageType::Text(text) = &ev.content.msgtype else { return };
     println!("[{}] {}: {}", room.room_id(), ev.sender, text.body);
     let body = text.body.clone();
+    // A Matrix thread is its own conversation (own session); the main
+    // timeline is another.
+    let thread = match &ev.content.relates_to {
+        Some(Relation::Thread(t)) => Some(t.event_id.clone()),
+        _ => None,
+    };
+    let reply_to = ev.event_id.clone();
     let me = client.user_id().map(ToOwned::to_owned);
 
     // Runs take seconds; don't hold up the sync loop meanwhile.
     tokio::spawn(async move {
+        let send = |text: String| {
+            let mut content = RoomMessageEventContent::text_markdown(text);
+            if let Some(root) = &thread {
+                content.relates_to =
+                    Some(Relation::Thread(Thread::plain(root.clone(), reply_to.clone())));
+            }
+            let room = room.clone();
+            async move {
+                if let Err(e) = room.send(content).await {
+                    eprintln!("send failed: {e}");
+                }
+            }
+        };
+        let thread_id = thread.as_ref().map(|t| t.as_str().to_owned());
+
+        if body.trim().eq_ignore_ascii_case("!new") {
+            let text = match agent.reset(room.room_id(), thread_id.as_deref()).await {
+                Ok(true) => "_New session: the next message starts fresh._".to_owned(),
+                Ok(false) => "_There was no session yet; the next message starts fresh._".to_owned(),
+                Err(e) => format!("_Could not reset the session: {e}_"),
+            };
+            send(text).await;
+            return;
+        }
+
         let sender = match room.get_member_no_sync(&ev.sender).await {
             Ok(Some(member)) => member.name().to_owned(),
             _ => ev.sender.localpart().to_owned(),
@@ -359,13 +394,13 @@ async fn on_message(
                 return;
             }
         };
-        let answer = agent.reply(room.room_id(), &sender, &body, &members).await;
+        let answer = agent
+            .reply(room.room_id(), thread_id.as_deref(), &sender, &body, &members)
+            .await;
         typing.abort();
         let _ = room.typing_notice(false).await;
 
-        if let Err(e) = room.send(RoomMessageEventContent::text_markdown(answer)).await {
-            eprintln!("send failed: {e}");
-        }
+        send(answer).await;
     });
 }
 

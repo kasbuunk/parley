@@ -5,7 +5,10 @@
 //! - `room.toml`: optional profile: where the agent runs, which tools and
 //!   settings it gets, who may be in the room, whether it keeps a session.
 //!   Without it a room is locked down: no tools, no settings, no memory.
-//! - `session`: the harness session ID, when the profile says `resume`.
+//! - `session`: the harness session ID for the room's main timeline, when
+//!   the profile says `resume`; `threads/<root event id>.session` for each
+//!   Matrix thread. A thread is its own conversation, so unrelated topics
+//!   don't share one context. `!new` clears the session it is sent in.
 //!
 //! Each message (prefixed with the sender's name) is one user turn. The
 //! model and harness sit behind [`Harness`]; Claude Code is the first
@@ -206,11 +209,13 @@ impl<H: Harness> Agent<H> {
         }
     }
 
-    /// The reply to post for `body`, sent by `sender` in `room_id`, whose
-    /// human members (everyone but the bot) are `members`.
+    /// The reply to post for `body`, sent by `sender` in `room_id` (in the
+    /// thread rooted at `thread`, if any), whose human members (everyone but
+    /// the bot) are `members`.
     pub async fn reply(
         &self,
         room_id: &RoomId,
+        thread: Option<&str>,
         sender: &str,
         body: &str,
         members: &[OwnedUserId],
@@ -225,7 +230,7 @@ impl<H: Harness> Agent<H> {
             );
         }
 
-        match self.run(room_id, sender, body, members).await {
+        match self.run(room_id, thread, sender, body, members).await {
             Ok(text) => {
                 self.breaker.lock().unwrap().success();
                 text
@@ -241,20 +246,48 @@ impl<H: Harness> Agent<H> {
         }
     }
 
-    async fn run(
-        &self,
-        room_id: &RoomId,
-        sender: &str,
-        body: &str,
-        members: &[OwnedUserId],
-    ) -> Result<String> {
+    /// Forget the session of the room's main timeline, or of one thread.
+    /// Returns whether there was one.
+    pub async fn reset(&self, room_id: &RoomId, thread: Option<&str>) -> Result<bool> {
+        let file = self.session_file(&self.room_dir(room_id)?, thread)?;
+        match tokio::fs::remove_file(&file).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn room_dir(&self, room_id: &RoomId) -> Result<PathBuf> {
         // Room IDs come from the homeserver; still, never let one name a
         // folder outside rooms/.
         let id = room_id.as_str();
         if id.contains('/') || id.contains("..") {
             bail!("refusing room ID {id:?}");
         }
-        let dir = self.rooms_dir.join(id);
+        Ok(self.rooms_dir.join(id))
+    }
+
+    fn session_file(&self, dir: &Path, thread: Option<&str>) -> Result<PathBuf> {
+        Ok(match thread {
+            None => dir.join("session"),
+            Some(root) => {
+                if root.contains('/') || root.contains("..") {
+                    bail!("refusing thread ID {root:?}");
+                }
+                dir.join("threads").join(format!("{root}.session"))
+            }
+        })
+    }
+
+    async fn run(
+        &self,
+        room_id: &RoomId,
+        thread: Option<&str>,
+        sender: &str,
+        body: &str,
+        members: &[OwnedUserId],
+    ) -> Result<String> {
+        let dir = self.room_dir(room_id)?;
         tokio::fs::create_dir_all(&dir).await?;
 
         let profile = match tokio::fs::read_to_string(dir.join("room.toml")).await {
@@ -288,7 +321,7 @@ impl<H: Harness> Agent<H> {
             Err(e) => return Err(e).context("could not read SYSTEM.md"),
         };
 
-        let session_file = dir.join("session");
+        let session_file = self.session_file(&dir, thread)?;
         let session = if profile.resume {
             tokio::fs::read_to_string(&session_file).await.ok().map(|s| s.trim().to_owned())
         } else {
@@ -307,6 +340,9 @@ impl<H: Harness> Agent<H> {
         match self.harness.run(&run).await {
             Ok(out) => {
                 if let (true, Some(id)) = (profile.resume, &out.session) {
+                    if let Some(parent) = session_file.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
                     tokio::fs::write(&session_file, id).await?;
                 }
                 Ok(out.text)
@@ -462,6 +498,7 @@ echo '{{"result":"ok"}}'"#,
         system_prompt: String,
         workdir: PathBuf,
         input: String,
+        session: Option<String>,
     }
 
     /// Records calls; answers from `results` (then "ok"). With `sleepy`, a
@@ -495,6 +532,7 @@ echo '{{"result":"ok"}}'"#,
                 system_prompt: run.system_prompt.to_owned(),
                 workdir: run.workdir.to_owned(),
                 input: input.to_owned(),
+                session: run.session.map(ToOwned::to_owned),
             });
             if self.sleepy {
                 let n = input.rsplit(' ').next().unwrap().to_owned();
@@ -503,7 +541,8 @@ echo '{{"result":"ok"}}'"#,
                 self.log.lock().unwrap().push(format!("end {n}"));
             }
             let text = self.results.lock().unwrap().pop_front().unwrap_or_else(|| Ok("ok".into()))?;
-            Ok(Output { text, session: None })
+            let n = self.calls.lock().unwrap().len();
+            Ok(Output { text, session: Some(format!("sess-{n}")) })
         }
     }
 
@@ -512,7 +551,7 @@ echo '{{"result":"ok"}}'"#,
         let tmp = tempfile::tempdir().unwrap();
         let agent = Agent::new(Fake::default(), tmp.path().join("rooms"));
         let r = room("!abc:example.org");
-        assert_eq!(agent.reply(&r, "Kas", "hello", &[]).await, "ok");
+        assert_eq!(agent.reply(&r, None, "Kas", "hello", &[]).await, "ok");
 
         let dir = tmp.path().join("rooms").join("!abc:example.org");
         let on_disk = std::fs::read_to_string(dir.join("SYSTEM.md")).unwrap();
@@ -529,9 +568,9 @@ echo '{{"result":"ok"}}'"#,
         let tmp = tempfile::tempdir().unwrap();
         let agent = Agent::new(Fake::default(), tmp.path().to_owned());
         let r = room("!abc:example.org");
-        agent.reply(&r, "Kas", "one", &[]).await;
+        agent.reply(&r, None, "Kas", "one", &[]).await;
         std::fs::write(tmp.path().join(r.as_str()).join("SYSTEM.md"), "Be a pirate.").unwrap();
-        agent.reply(&r, "Camille", "two", &[]).await;
+        agent.reply(&r, None, "Camille", "two", &[]).await;
 
         let calls = agent.harness.calls();
         assert_eq!(calls[1].system_prompt, "Be a pirate.");
@@ -542,8 +581,8 @@ echo '{{"result":"ok"}}'"#,
     async fn rooms_have_separate_folders() {
         let tmp = tempfile::tempdir().unwrap();
         let agent = Agent::new(Fake::default(), tmp.path().to_owned());
-        agent.reply(&room("!a:example.org"), "Kas", "x", &[]).await;
-        agent.reply(&room("!b:example.org"), "Kas", "y", &[]).await;
+        agent.reply(&room("!a:example.org"), None, "Kas", "x", &[]).await;
+        agent.reply(&room("!b:example.org"), None, "Kas", "y", &[]).await;
         let calls = agent.harness.calls();
         assert_ne!(calls[0].workdir, calls[1].workdir);
         assert!(tmp.path().join("!a:example.org/SYSTEM.md").exists());
@@ -554,7 +593,7 @@ echo '{{"result":"ok"}}'"#,
     async fn input_is_sender_in_brackets_then_body() {
         let tmp = tempfile::tempdir().unwrap();
         let agent = Agent::new(Fake::default(), tmp.path().to_owned());
-        agent.reply(&room("!a:example.org"), "Kas Buunk", "multi\nline", &[]).await;
+        agent.reply(&room("!a:example.org"), None, "Kas Buunk", "multi\nline", &[]).await;
         assert_eq!(agent.harness.calls()[0].input, "[Kas Buunk] multi\nline");
     }
 
@@ -562,7 +601,7 @@ echo '{{"result":"ok"}}'"#,
     async fn harness_error_becomes_error_reply() {
         let tmp = tempfile::tempdir().unwrap();
         let agent = Agent::new(Fake::failing(1), tmp.path().to_owned());
-        let reply = agent.reply(&room("!a:example.org"), "Kas", "x", &[]).await;
+        let reply = agent.reply(&room("!a:example.org"), None, "Kas", "x", &[]).await;
         assert_eq!(reply, "_Agent error: fail 0_");
     }
 
@@ -572,13 +611,13 @@ echo '{{"result":"ok"}}'"#,
         let agent = Agent::new(Fake::failing(3), tmp.path().to_owned());
         let r = room("!a:example.org");
         for _ in 0..3 {
-            assert!(agent.reply(&r, "Kas", "x", &[]).await.starts_with("_Agent error"));
+            assert!(agent.reply(&r, None, "Kas", "x", &[]).await.starts_with("_Agent error"));
         }
-        let reply = agent.reply(&r, "Kas", "x", &[]).await;
+        let reply = agent.reply(&r, None, "Kas", "x", &[]).await;
         assert_eq!(reply, "_Agent paused after repeated failures; trying again in 5 min._");
         assert_eq!(agent.harness.calls().len(), 3);
         // The breaker is shared: other rooms are paused too.
-        let other = agent.reply(&room("!b:example.org"), "Kas", "x", &[]).await;
+        let other = agent.reply(&room("!b:example.org"), None, "Kas", "x", &[]).await;
         assert!(other.contains("paused"), "{other}");
         assert_eq!(agent.harness.calls().len(), 3);
     }
@@ -599,7 +638,7 @@ echo '{{"result":"ok"}}'"#,
         let r = room("!a:example.org");
         let mut replies = Vec::new();
         for _ in 0..6 {
-            replies.push(agent.reply(&r, "Kas", "x", &[]).await);
+            replies.push(agent.reply(&r, None, "Kas", "x", &[]).await);
         }
         assert_eq!(replies[2], "fine");
         // Two failures after the success do not open the breaker: call 6 runs.
@@ -617,7 +656,7 @@ echo '{{"result":"ok"}}'"#,
         // Long first, short later: without the room lock they would overlap.
         for ms in ["150", "50", "0"] {
             let (agent, r) = (agent.clone(), r.clone());
-            tasks.push(tokio::spawn(async move { agent.reply(&r, "Kas", ms, &[]).await }));
+            tasks.push(tokio::spawn(async move { agent.reply(&r, None, "Kas", ms, &[]).await }));
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         for t in tasks {
@@ -634,16 +673,72 @@ echo '{{"result":"ok"}}'"#,
             Arc::new(Agent::new(Fake { sleepy: true, ..Default::default() }, tmp.path().to_owned()));
         let a = {
             let agent = agent.clone();
-            tokio::spawn(async move { agent.reply(&room("!a:example.org"), "Kas", "150", &[]).await })
+            tokio::spawn(async move { agent.reply(&room("!a:example.org"), None, "Kas", "150", &[]).await })
         };
         tokio::time::sleep(Duration::from_millis(20)).await;
         let b = {
             let agent = agent.clone();
-            tokio::spawn(async move { agent.reply(&room("!b:example.org"), "Kas", "10", &[]).await })
+            tokio::spawn(async move { agent.reply(&room("!b:example.org"), None, "Kas", "10", &[]).await })
         };
         a.await.unwrap();
         b.await.unwrap();
         let log = agent.harness.log.lock().unwrap().clone();
         assert_eq!(log, ["start 150", "start 10", "end 10", "end 150"]);
+    }
+
+    // ---- sessions: main timeline, threads, !new ----
+
+    fn resume_room(rooms: &Path, id: &str) {
+        let dir = rooms.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("room.toml"), "resume = true\n").unwrap();
+    }
+
+    #[tokio::test]
+    async fn main_timeline_and_threads_keep_separate_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        resume_room(tmp.path(), "!a:example.org");
+        let agent = Agent::new(Fake::default(), tmp.path().to_owned());
+        let r = room("!a:example.org");
+
+        agent.reply(&r, None, "Kas", "one", &[]).await; // main: new -> sess-1
+        agent.reply(&r, Some("$t1"), "Kas", "two", &[]).await; // thread: new -> sess-2
+        agent.reply(&r, None, "Kas", "three", &[]).await; // main resumes sess-1
+        agent.reply(&r, Some("$t1"), "Kas", "four", &[]).await; // thread resumes sess-2
+
+        let sessions: Vec<_> = agent.harness.calls().into_iter().map(|c| c.session).collect();
+        assert_eq!(sessions, [None, None, Some("sess-1".into()), Some("sess-2".into())]);
+        let dir = tmp.path().join("!a:example.org");
+        assert!(dir.join("session").exists());
+        assert!(dir.join("threads").join("$t1.session").exists());
+    }
+
+    #[tokio::test]
+    async fn reset_clears_only_that_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        resume_room(tmp.path(), "!a:example.org");
+        let agent = Agent::new(Fake::default(), tmp.path().to_owned());
+        let r = room("!a:example.org");
+        agent.reply(&r, None, "Kas", "one", &[]).await;
+        agent.reply(&r, Some("$t1"), "Kas", "two", &[]).await;
+
+        assert!(agent.reset(&r, None).await.unwrap());
+        assert!(!agent.reset(&r, None).await.unwrap()); // nothing left to clear
+        agent.reply(&r, None, "Kas", "fresh", &[]).await;
+        agent.reply(&r, Some("$t1"), "Kas", "still", &[]).await;
+
+        let calls = agent.harness.calls();
+        assert_eq!(calls[2].session, None); // main started over
+        assert_eq!(calls[3].session.as_deref(), Some("sess-2")); // thread kept
+    }
+
+    #[tokio::test]
+    async fn thread_ids_cannot_escape_the_room_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        resume_room(tmp.path(), "!a:example.org");
+        let agent = Agent::new(Fake::default(), tmp.path().to_owned());
+        let reply = agent.reply(&room("!a:example.org"), Some("$../../x"), "Kas", "hi", &[]).await;
+        assert!(reply.starts_with("_Agent error"), "{reply}");
+        assert!(agent.reset(&room("!a:example.org"), Some("a/b")).await.is_err());
     }
 }
