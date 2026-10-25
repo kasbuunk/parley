@@ -41,18 +41,17 @@ use std::{
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use matrix_sdk::{
-    Client, Room, RoomMemberships, RoomState,
+    Client, LoopCtrl, Room, RoomMemberships, RoomState,
     authentication::matrix::MatrixSession,
-    LoopCtrl,
     config::SyncSettings,
-    event_handler::Ctx,
     encryption::{
         CrossSigningResetAuthType,
         verification::{
-            SasState, SasVerification, Verification, VerificationRequest,
-            VerificationRequestState, format_emojis,
+            SasState, SasVerification, Verification, VerificationRequest, VerificationRequestState,
+            format_emojis,
         },
     },
+    event_handler::Ctx,
     ruma::{
         OwnedUserId,
         api::{client::uiaa, error::ErrorKind},
@@ -92,9 +91,10 @@ struct Config {
 
 impl Config {
     fn from_env() -> Result<Self> {
-        let allowed = parse_allowed(&env::var("PARLEY_ALLOWED").unwrap_or_else(|_| {
-            "@kas:chat.lab.artintel.ai,@camille:chat.lab.artintel.ai".into()
-        }))?;
+        let allowed =
+            parse_allowed(&env::var("PARLEY_ALLOWED").unwrap_or_else(|_| {
+                "@kas:chat.lab.artintel.ai,@camille:chat.lab.artintel.ai".into()
+            }))?;
         let data_dir = match env::var_os("PARLEY_DATA_DIR") {
             Some(d) => d.into(),
             None => dirs::data_dir().context("no data dir")?.join("parley"),
@@ -113,7 +113,11 @@ impl Config {
 /// The user IDs in a comma-separated `PARLEY_ALLOWED` value.
 fn parse_allowed(list: &str) -> Result<Vec<OwnedUserId>> {
     list.split(',')
-        .map(|s| s.trim().try_into().with_context(|| format!("bad user ID {s:?}")))
+        .map(|s| {
+            s.trim()
+                .try_into()
+                .with_context(|| format!("bad user ID {s:?}"))
+        })
         .collect()
 }
 
@@ -155,33 +159,39 @@ async fn main() -> Result<()> {
     let response = client.sync_once(SyncSettings::default()).await?;
 
     let allowed = config.allowed.clone();
-    client.add_event_handler(move |ev: StrippedRoomMemberEvent, client: Client, room: Room| {
-        let allowed = allowed.clone();
-        async move { on_invite(ev, client, room, &allowed).await }
-    });
+    client.add_event_handler(
+        move |ev: StrippedRoomMemberEvent, client: Client, room: Room| {
+            let allowed = allowed.clone();
+            async move { on_invite(ev, client, room, &allowed).await }
+        },
+    );
     let agent = Agent::new(
-        ClaudeCode { program: config.claude.clone() },
+        ClaudeCode {
+            program: config.claude.clone(),
+        },
         config.data_dir.join("rooms"),
     );
     client.add_event_handler_context(Arc::new(agent));
     client.add_event_handler(on_message);
     let allowed = config.allowed.clone();
-    client.add_event_handler(move |ev: ToDeviceKeyVerificationRequestEvent, client: Client| {
-        let allowed = allowed.clone();
-        async move {
-            if !allowed.contains(&ev.sender) {
-                println!("ignoring verification request from {}", ev.sender);
-                return;
+    client.add_event_handler(
+        move |ev: ToDeviceKeyVerificationRequestEvent, client: Client| {
+            let allowed = allowed.clone();
+            async move {
+                if !allowed.contains(&ev.sender) {
+                    println!("ignoring verification request from {}", ev.sender);
+                    return;
+                }
+                if let Some(request) = client
+                    .encryption()
+                    .get_verification_request(&ev.sender, &ev.content.transaction_id)
+                    .await
+                {
+                    tokio::spawn(handle_verification_request(request));
+                }
             }
-            if let Some(request) = client
-                .encryption()
-                .get_verification_request(&ev.sender, &ev.content.transaction_id)
-                .await
-            {
-                tokio::spawn(handle_verification_request(request));
-            }
-        }
-    });
+        },
+    );
 
     println!("listening");
     sync_forever(&client, SyncSettings::default().token(response.next_batch)).await
@@ -255,7 +265,10 @@ async fn first_login(
     let text = std::fs::read_to_string(path)?;
     let mut lines = text.lines();
     let (Some(user), Some(password)) = (lines.next(), lines.next()) else {
-        bail!("{} must hold the user ID and the password on two lines", path.display());
+        bail!(
+            "{} must hold the user ID and the password on two lines",
+            path.display()
+        );
     };
 
     let store_passphrase = random_hex(32)?;
@@ -273,17 +286,24 @@ async fn first_login(
     let saved = SavedSession {
         homeserver: config.homeserver.clone(),
         store_passphrase,
-        matrix: client.matrix_auth().session().context("logged in but no session")?,
+        matrix: client
+            .matrix_auth()
+            .session()
+            .context("logged in but no session")?,
     };
     write_private(session_file, &serde_json::to_string_pretty(&saved)?)?;
-    println!("logged in as {user}; session saved to {}", session_file.display());
+    println!(
+        "logged in as {user}; session saved to {}",
+        session_file.display()
+    );
 
     // A first sync uploads the device keys; then create the cross-signing
     // identity. The server asks for the password again (user-interactive auth).
     client.sync_once(SyncSettings::default()).await?;
     if let Some(handle) = client.encryption().reset_cross_signing().await? {
         if let CrossSigningResetAuthType::Uiaa(uiaa) = handle.auth_type() {
-            let mut auth = uiaa::Password::new(client.user_id().unwrap().to_owned().into(), password.into());
+            let mut auth =
+                uiaa::Password::new(client.user_id().unwrap().to_owned().into(), password.into());
             auth.session = uiaa.session.clone();
             handle.auth(Some(uiaa::AuthData::Password(auth))).await?;
         }
@@ -293,7 +313,12 @@ async fn first_login(
 }
 
 /// Join rooms we are invited to, but only when the inviter is on the allow list.
-async fn on_invite(ev: StrippedRoomMemberEvent, client: Client, room: Room, allowed: &[OwnedUserId]) {
+async fn on_invite(
+    ev: StrippedRoomMemberEvent,
+    client: Client,
+    room: Room,
+    allowed: &[OwnedUserId],
+) {
     if ev.state_key != client.user_id().unwrap() {
         return;
     }
@@ -321,14 +346,18 @@ async fn on_message(
     if let MessageType::VerificationRequest(_) = &ev.content.msgtype {
         // Element verifies a *user* through a message in a room. The bot only
         // sees rooms it was invited to by allowed people, so no extra check.
-        if let Some(request) =
-            client.encryption().get_verification_request(&ev.sender, &ev.event_id).await
+        if let Some(request) = client
+            .encryption()
+            .get_verification_request(&ev.sender, &ev.event_id)
+            .await
         {
             tokio::spawn(handle_verification_request(request));
         }
         return;
     }
-    let MessageType::Text(text) = &ev.content.msgtype else { return };
+    let MessageType::Text(text) = &ev.content.msgtype else {
+        return;
+    };
     println!("[{}] {}: {}", room.room_id(), ev.sender, text.body);
     let body = text.body.clone();
     // A Matrix thread is its own conversation (own session); the main
@@ -345,8 +374,10 @@ async fn on_message(
         let send = |text: String| {
             let mut content = RoomMessageEventContent::text_markdown(text);
             if let Some(root) = &thread {
-                content.relates_to =
-                    Some(Relation::Thread(Thread::plain(root.clone(), reply_to.clone())));
+                content.relates_to = Some(Relation::Thread(Thread::plain(
+                    root.clone(),
+                    reply_to.clone(),
+                )));
             }
             let room = room.clone();
             async move {
@@ -356,11 +387,24 @@ async fn on_message(
             }
         };
         let thread_id = thread.as_ref().map(|t| t.as_str().to_owned());
+        if let Err(e) = agent
+            .record(
+                room.room_id(),
+                thread_id.as_deref(),
+                ev.sender.as_str(),
+                &body,
+            )
+            .await
+        {
+            eprintln!("could not write transcript: {e}");
+        }
 
         if body.trim().eq_ignore_ascii_case("!new") {
             let text = match agent.reset(room.room_id(), thread_id.as_deref()).await {
                 Ok(true) => "_New session: the next message starts fresh._".to_owned(),
-                Ok(false) => "_There was no session yet; the next message starts fresh._".to_owned(),
+                Ok(false) => {
+                    "_There was no session yet; the next message starts fresh._".to_owned()
+                }
                 Err(e) => format!("_Could not reset the session: {e}_"),
             };
             send(text).await;
@@ -389,18 +433,42 @@ async fn on_message(
                 .collect(),
             Err(e) => {
                 eprintln!("could not list members: {e}");
-                let _ = room.send(RoomMessageEventContent::text_plain("Could not check who is in this room; not running.")).await;
+                let _ = room
+                    .send(RoomMessageEventContent::text_plain(
+                        "Could not check who is in this room; not running.",
+                    ))
+                    .await;
                 typing.abort();
                 return;
             }
         };
         let answer = agent
-            .reply(room.room_id(), thread_id.as_deref(), &sender, &body, &members)
+            .reply(
+                room.room_id(),
+                thread_id.as_deref(),
+                &sender,
+                &body,
+                &members,
+            )
             .await;
         typing.abort();
         let _ = room.typing_notice(false).await;
 
+        if let Err(e) = agent
+            .record(room.room_id(), thread_id.as_deref(), "agent", &answer)
+            .await
+        {
+            eprintln!("could not write transcript: {e}");
+        }
         send(answer).await;
+
+        // An agent working on parley itself asks for a restart by creating
+        // `restart` in the data dir; exit only after its reply is out, and
+        // let systemd (Restart=always) start the new build.
+        if agent.take_restart_request() {
+            println!("restart requested by an agent; exiting");
+            std::process::exit(0);
+        }
     });
 }
 
@@ -414,7 +482,9 @@ async fn handle_verification_request(request: VerificationRequest) {
     let mut changes = request.changes();
     while let Some(state) = changes.next().await {
         match state {
-            VerificationRequestState::Transitioned { verification: Verification::SasV1(sas) } => {
+            VerificationRequestState::Transitioned {
+                verification: Verification::SasV1(sas),
+            } => {
                 handle_sas(sas).await;
                 break;
             }
@@ -432,7 +502,10 @@ async fn handle_sas(sas: SasVerification) {
     let mut changes = sas.changes();
     while let Some(state) = changes.next().await {
         match state {
-            SasState::KeysExchanged { emojis: Some(emojis), .. } => {
+            SasState::KeysExchanged {
+                emojis: Some(emojis),
+                ..
+            } => {
                 println!(
                     "\nVERIFY with {} {}: compare with Element, press \"They match\" only if equal:\n{}\n",
                     sas.other_device().user_id(),
@@ -444,7 +517,11 @@ async fn handle_sas(sas: SasVerification) {
                 }
             }
             SasState::Done { .. } => {
-                println!("verified {} {}", sas.other_device().user_id(), sas.other_device().device_id());
+                println!(
+                    "verified {} {}",
+                    sas.other_device().user_id(),
+                    sas.other_device().device_id()
+                );
                 break;
             }
             SasState::Cancelled(info) => {
@@ -466,7 +543,12 @@ fn random_hex(bytes: usize) -> Result<String> {
 /// Write a file readable only by the owner (it holds an access token).
 fn write_private(path: &PathBuf, contents: &str) -> Result<()> {
     use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt};
-    let mut f = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
     f.write_all(contents.as_bytes())?;
     Ok(())
 }
@@ -487,7 +569,10 @@ mod tests {
         let allowed =
             parse_allowed("@kas:chat.lab.artintel.ai,@camille:chat.lab.artintel.ai").unwrap();
         let ids: Vec<&str> = allowed.iter().map(|u| u.as_str()).collect();
-        assert_eq!(ids, ["@kas:chat.lab.artintel.ai", "@camille:chat.lab.artintel.ai"]);
+        assert_eq!(
+            ids,
+            ["@kas:chat.lab.artintel.ai", "@camille:chat.lab.artintel.ai"]
+        );
     }
 
     #[test]

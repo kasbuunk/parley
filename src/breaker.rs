@@ -25,7 +25,12 @@ pub enum State {
 
 impl Breaker {
     pub fn new(threshold: u32, cooldown: Duration) -> Self {
-        Self { threshold, cooldown, failures: 0, open_until: None }
+        Self {
+            threshold,
+            cooldown,
+            failures: 0,
+            open_until: None,
+        }
     }
 
     pub fn state(&self) -> State {

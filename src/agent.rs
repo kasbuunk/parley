@@ -10,6 +10,10 @@
 //!   Matrix thread. A thread is its own conversation, so unrelated topics
 //!   don't share one context. `!new` clears the session it is sent in.
 //!
+//! - `transcript.jsonl`: every text message in the room and every reply,
+//!   one JSON object per line (`ts`, `sender`, `thread`, `body`). Not sent
+//!   to the model; an agent with file tools can read or grep it to look back.
+//!
 //! Each message (prefixed with the sender's name) is one user turn. The
 //! model and harness sit behind [`Harness`]; Claude Code is the first
 //! implementation, Pi can be a second.
@@ -185,7 +189,10 @@ impl Harness for ClaudeCode {
             )
         })?;
         match reply.result {
-            Some(text) if !reply.is_error => Ok(Output { text, session: reply.session_id }),
+            Some(text) if !reply.is_error => Ok(Output {
+                text,
+                session: reply.session_id,
+            }),
             other => bail!("claude reported an error: {}", other.unwrap_or_default()),
         }
     }
@@ -220,7 +227,13 @@ impl<H: Harness> Agent<H> {
         body: &str,
         members: &[OwnedUserId],
     ) -> String {
-        let lock = self.room_locks.lock().unwrap().entry(room_id.to_owned()).or_default().clone();
+        let lock = self
+            .room_locks
+            .lock()
+            .unwrap()
+            .entry(room_id.to_owned())
+            .or_default()
+            .clone();
         let _turn = lock.lock().await;
 
         if let State::Open(left) = self.breaker.lock().unwrap().state() {
@@ -255,6 +268,43 @@ impl<H: Harness> Agent<H> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Append one line to the room's transcript.
+    pub async fn record(
+        &self,
+        room_id: &RoomId,
+        thread: Option<&str>,
+        sender: &str,
+        body: &str,
+    ) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let dir = self.room_dir(room_id)?;
+        tokio::fs::create_dir_all(&dir).await?;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let mut line = serde_json::to_string(&serde_json::json!({
+            "ts": ts, "sender": sender, "thread": thread, "body": body,
+        }))?;
+        line.push('\n');
+        let mut f = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("transcript.jsonl"))
+            .await?;
+        f.write_all(line.as_bytes()).await?;
+        Ok(())
+    }
+
+    /// Whether an agent asked parley to restart (by creating the file
+    /// `restart` next to `rooms/`). Consumes the request.
+    pub fn take_restart_request(&self) -> bool {
+        let Some(base) = self.rooms_dir.parent() else {
+            return false;
+        };
+        std::fs::remove_file(base.join("restart")).is_ok()
     }
 
     fn room_dir(&self, room_id: &RoomId) -> Result<PathBuf> {
@@ -323,7 +373,10 @@ impl<H: Harness> Agent<H> {
 
         let session_file = self.session_file(&dir, thread)?;
         let session = if profile.resume {
-            tokio::fs::read_to_string(&session_file).await.ok().map(|s| s.trim().to_owned())
+            tokio::fs::read_to_string(&session_file)
+                .await
+                .ok()
+                .map(|s| s.trim().to_owned())
         } else {
             None
         };
@@ -362,7 +415,7 @@ impl<H: Harness> Agent<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::VecDeque, os::unix::fs::PermissionsExt, time::Instant};
+    use std::{collections::VecDeque, time::Instant};
 
     use anyhow::anyhow;
     use matrix_sdk::ruma::OwnedRoomId;
@@ -375,9 +428,20 @@ mod tests {
 
     /// A fake `claude`: an executable shell script with `body` in `dir`.
     fn script(dir: &Path, body: &str) -> String {
+        // Written by a separate `sh`, not by this process: tests run in
+        // parallel threads, and a child forked by another test while we held
+        // the file open for writing makes Linux refuse to exec it
+        // ("Text file busy").
+        use std::io::Write;
         let path = dir.join("fake-claude");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut sh = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        sh.stdin.take().unwrap().write_all(format!("#!/bin/sh\n{body}\n").as_bytes()).unwrap();
+        assert!(sh.wait().unwrap().success());
         path.to_str().unwrap().to_owned()
     }
 
@@ -392,8 +456,17 @@ mod tests {
         /// Run with the default (locked-down) profile. Profiles count
         /// whole seconds; tests want less, so the timeout is applied here.
         async fn run(&self, system_prompt: &str, workdir: &Path, input: &str) -> Result<String> {
-            let profile = Profile { timeout_secs: 60, ..Profile::default() };
-            let run = Run { profile: &profile, system_prompt, workdir, input, session: None };
+            let profile = Profile {
+                timeout_secs: 60,
+                ..Profile::default()
+            };
+            let run = Run {
+                profile: &profile,
+                system_prompt,
+                workdir,
+                input,
+                session: None,
+            };
             match tokio::time::timeout(self.1, self.0.run(&run)).await {
                 Ok(r) => r.map(|o| o.text),
                 Err(_) => bail!("no answer within {:?}", self.1),
@@ -408,7 +481,10 @@ mod tests {
             script(tmp.path(), r#"echo '{"result":"hi","is_error":false}'"#),
             Duration::from_secs(10),
         );
-        assert_eq!(cc.run("sys", tmp.path(), "[Kas] hello").await.unwrap(), "hi");
+        assert_eq!(
+            cc.run("sys", tmp.path(), "[Kas] hello").await.unwrap(),
+            "hi"
+        );
     }
 
     #[tokio::test]
@@ -425,7 +501,10 @@ mod tests {
     #[tokio::test]
     async fn claude_code_missing_result_is_an_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let cc = claude(script(tmp.path(), r#"echo '{"is_error":false}'"#), Duration::from_secs(10));
+        let cc = claude(
+            script(tmp.path(), r#"echo '{"is_error":false}'"#),
+            Duration::from_secs(10),
+        );
         assert!(cc.run("sys", tmp.path(), "x").await.is_err());
     }
 
@@ -444,10 +523,17 @@ mod tests {
     #[tokio::test]
     async fn claude_code_times_out() {
         let tmp = tempfile::tempdir().unwrap();
-        let cc = claude(script(tmp.path(), "exec sleep 10"), Duration::from_millis(200));
+        let cc = claude(
+            script(tmp.path(), "exec sleep 10"),
+            Duration::from_millis(200),
+        );
         let start = Instant::now();
         let err = format!("{:#}", cc.run("sys", tmp.path(), "x").await.unwrap_err());
-        assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            start.elapsed()
+        );
         assert!(err.contains("no answer within"), "{err}");
     }
 
@@ -455,7 +541,13 @@ mod tests {
     async fn claude_code_missing_program_fails_to_start() {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("nope").to_str().unwrap().to_owned();
-        let err = format!("{:#}", claude(missing, Duration::from_secs(1)).run("s", tmp.path(), "x").await.unwrap_err());
+        let err = format!(
+            "{:#}",
+            claude(missing, Duration::from_secs(1))
+                .run("s", tmp.path(), "x")
+                .await
+                .unwrap_err()
+        );
         assert!(err.contains("could not start"), "{err}");
     }
 
@@ -472,7 +564,10 @@ echo '{{"result":"ok"}}'"#,
             d = dump.display()
         );
         let cc = claude(script(tmp.path(), &body), Duration::from_secs(10));
-        let reply = cc.run("be brief", &workdir, "[Kas] hi there").await.unwrap();
+        let reply = cc
+            .run("be brief", &workdir, "[Kas] hi there")
+            .await
+            .unwrap();
         assert_eq!(reply, "ok"); // is_error defaults to false
 
         let dump = std::fs::read_to_string(dump).unwrap();
@@ -483,10 +578,19 @@ echo '{{"result":"ok"}}'"#,
         assert_eq!(
             args,
             [
-                "<-p>", "<[Kas] hi there>", "<--system-prompt>", "<be brief>",
-                "<--tools>", "<>", "<--strict-mcp-config>", "<--setting-sources>", "<>",
-                "<--disable-slash-commands>", "<--no-session-persistence>",
-                "<--output-format>", "<json>",
+                "<-p>",
+                "<[Kas] hi there>",
+                "<--system-prompt>",
+                "<be brief>",
+                "<--tools>",
+                "<>",
+                "<--strict-mcp-config>",
+                "<--setting-sources>",
+                "<>",
+                "<--disable-slash-commands>",
+                "<--no-session-persistence>",
+                "<--output-format>",
+                "<json>",
             ]
         );
     }
@@ -516,7 +620,10 @@ echo '{{"result":"ok"}}'"#,
         fn failing(n: usize) -> Self {
             let f = Fake::default();
             for i in 0..n {
-                f.results.lock().unwrap().push_back(Err(anyhow!("fail {i}")));
+                f.results
+                    .lock()
+                    .unwrap()
+                    .push_back(Err(anyhow!("fail {i}")));
             }
             f
         }
@@ -540,9 +647,17 @@ echo '{{"result":"ok"}}'"#,
                 tokio::time::sleep(Duration::from_millis(n.parse().unwrap())).await;
                 self.log.lock().unwrap().push(format!("end {n}"));
             }
-            let text = self.results.lock().unwrap().pop_front().unwrap_or_else(|| Ok("ok".into()))?;
+            let text = self
+                .results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok("ok".into()))?;
             let n = self.calls.lock().unwrap().len();
-            Ok(Output { text, session: Some(format!("sess-{n}")) })
+            Ok(Output {
+                text,
+                session: Some(format!("sess-{n}")),
+            })
         }
     }
 
@@ -569,7 +684,11 @@ echo '{{"result":"ok"}}'"#,
         let agent = Agent::new(Fake::default(), tmp.path().to_owned());
         let r = room("!abc:example.org");
         agent.reply(&r, None, "Kas", "one", &[]).await;
-        std::fs::write(tmp.path().join(r.as_str()).join("SYSTEM.md"), "Be a pirate.").unwrap();
+        std::fs::write(
+            tmp.path().join(r.as_str()).join("SYSTEM.md"),
+            "Be a pirate.",
+        )
+        .unwrap();
         agent.reply(&r, None, "Camille", "two", &[]).await;
 
         let calls = agent.harness.calls();
@@ -581,8 +700,12 @@ echo '{{"result":"ok"}}'"#,
     async fn rooms_have_separate_folders() {
         let tmp = tempfile::tempdir().unwrap();
         let agent = Agent::new(Fake::default(), tmp.path().to_owned());
-        agent.reply(&room("!a:example.org"), None, "Kas", "x", &[]).await;
-        agent.reply(&room("!b:example.org"), None, "Kas", "y", &[]).await;
+        agent
+            .reply(&room("!a:example.org"), None, "Kas", "x", &[])
+            .await;
+        agent
+            .reply(&room("!b:example.org"), None, "Kas", "y", &[])
+            .await;
         let calls = agent.harness.calls();
         assert_ne!(calls[0].workdir, calls[1].workdir);
         assert!(tmp.path().join("!a:example.org/SYSTEM.md").exists());
@@ -593,7 +716,15 @@ echo '{{"result":"ok"}}'"#,
     async fn input_is_sender_in_brackets_then_body() {
         let tmp = tempfile::tempdir().unwrap();
         let agent = Agent::new(Fake::default(), tmp.path().to_owned());
-        agent.reply(&room("!a:example.org"), None, "Kas Buunk", "multi\nline", &[]).await;
+        agent
+            .reply(
+                &room("!a:example.org"),
+                None,
+                "Kas Buunk",
+                "multi\nline",
+                &[],
+            )
+            .await;
         assert_eq!(agent.harness.calls()[0].input, "[Kas Buunk] multi\nline");
     }
 
@@ -601,7 +732,9 @@ echo '{{"result":"ok"}}'"#,
     async fn harness_error_becomes_error_reply() {
         let tmp = tempfile::tempdir().unwrap();
         let agent = Agent::new(Fake::failing(1), tmp.path().to_owned());
-        let reply = agent.reply(&room("!a:example.org"), None, "Kas", "x", &[]).await;
+        let reply = agent
+            .reply(&room("!a:example.org"), None, "Kas", "x", &[])
+            .await;
         assert_eq!(reply, "_Agent error: fail 0_");
     }
 
@@ -611,13 +744,23 @@ echo '{{"result":"ok"}}'"#,
         let agent = Agent::new(Fake::failing(3), tmp.path().to_owned());
         let r = room("!a:example.org");
         for _ in 0..3 {
-            assert!(agent.reply(&r, None, "Kas", "x", &[]).await.starts_with("_Agent error"));
+            assert!(
+                agent
+                    .reply(&r, None, "Kas", "x", &[])
+                    .await
+                    .starts_with("_Agent error")
+            );
         }
         let reply = agent.reply(&r, None, "Kas", "x", &[]).await;
-        assert_eq!(reply, "_Agent paused after repeated failures; trying again in 5 min._");
+        assert_eq!(
+            reply,
+            "_Agent paused after repeated failures; trying again in 5 min._"
+        );
         assert_eq!(agent.harness.calls().len(), 3);
         // The breaker is shared: other rooms are paused too.
-        let other = agent.reply(&room("!b:example.org"), None, "Kas", "x", &[]).await;
+        let other = agent
+            .reply(&room("!b:example.org"), None, "Kas", "x", &[])
+            .await;
         assert!(other.contains("paused"), "{other}");
         assert_eq!(agent.harness.calls().len(), 3);
     }
@@ -649,36 +792,66 @@ echo '{{"result":"ok"}}'"#,
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn replies_in_one_room_are_serialized_in_arrival_order() {
         let tmp = tempfile::tempdir().unwrap();
-        let agent =
-            Arc::new(Agent::new(Fake { sleepy: true, ..Default::default() }, tmp.path().to_owned()));
+        let agent = Arc::new(Agent::new(
+            Fake {
+                sleepy: true,
+                ..Default::default()
+            },
+            tmp.path().to_owned(),
+        ));
         let r = room("!a:example.org");
         let mut tasks = Vec::new();
         // Long first, short later: without the room lock they would overlap.
         for ms in ["150", "50", "0"] {
             let (agent, r) = (agent.clone(), r.clone());
-            tasks.push(tokio::spawn(async move { agent.reply(&r, None, "Kas", ms, &[]).await }));
+            tasks.push(tokio::spawn(async move {
+                agent.reply(&r, None, "Kas", ms, &[]).await
+            }));
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         for t in tasks {
             assert_eq!(t.await.unwrap(), "ok");
         }
         let log = agent.harness.log.lock().unwrap().clone();
-        assert_eq!(log, ["start 150", "end 150", "start 50", "end 50", "start 0", "end 0"]);
+        assert_eq!(
+            log,
+            [
+                "start 150",
+                "end 150",
+                "start 50",
+                "end 50",
+                "start 0",
+                "end 0"
+            ]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn different_rooms_run_concurrently() {
         let tmp = tempfile::tempdir().unwrap();
-        let agent =
-            Arc::new(Agent::new(Fake { sleepy: true, ..Default::default() }, tmp.path().to_owned()));
+        let agent = Arc::new(Agent::new(
+            Fake {
+                sleepy: true,
+                ..Default::default()
+            },
+            tmp.path().to_owned(),
+        ));
         let a = {
             let agent = agent.clone();
-            tokio::spawn(async move { agent.reply(&room("!a:example.org"), None, "Kas", "150", &[]).await })
+            tokio::spawn(async move {
+                agent
+                    .reply(&room("!a:example.org"), None, "Kas", "150", &[])
+                    .await
+            })
         };
         tokio::time::sleep(Duration::from_millis(20)).await;
         let b = {
             let agent = agent.clone();
-            tokio::spawn(async move { agent.reply(&room("!b:example.org"), None, "Kas", "10", &[]).await })
+            tokio::spawn(async move {
+                agent
+                    .reply(&room("!b:example.org"), None, "Kas", "10", &[])
+                    .await
+            })
         };
         a.await.unwrap();
         b.await.unwrap();
@@ -706,8 +879,16 @@ echo '{{"result":"ok"}}'"#,
         agent.reply(&r, None, "Kas", "three", &[]).await; // main resumes sess-1
         agent.reply(&r, Some("$t1"), "Kas", "four", &[]).await; // thread resumes sess-2
 
-        let sessions: Vec<_> = agent.harness.calls().into_iter().map(|c| c.session).collect();
-        assert_eq!(sessions, [None, None, Some("sess-1".into()), Some("sess-2".into())]);
+        let sessions: Vec<_> = agent
+            .harness
+            .calls()
+            .into_iter()
+            .map(|c| c.session)
+            .collect();
+        assert_eq!(
+            sessions,
+            [None, None, Some("sess-1".into()), Some("sess-2".into())]
+        );
         let dir = tmp.path().join("!a:example.org");
         assert!(dir.join("session").exists());
         assert!(dir.join("threads").join("$t1.session").exists());
@@ -737,8 +918,49 @@ echo '{{"result":"ok"}}'"#,
         let tmp = tempfile::tempdir().unwrap();
         resume_room(tmp.path(), "!a:example.org");
         let agent = Agent::new(Fake::default(), tmp.path().to_owned());
-        let reply = agent.reply(&room("!a:example.org"), Some("$../../x"), "Kas", "hi", &[]).await;
+        let reply = agent
+            .reply(&room("!a:example.org"), Some("$../../x"), "Kas", "hi", &[])
+            .await;
         assert!(reply.starts_with("_Agent error"), "{reply}");
-        assert!(agent.reset(&room("!a:example.org"), Some("a/b")).await.is_err());
+        assert!(
+            agent
+                .reset(&room("!a:example.org"), Some("a/b"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn transcript_appends_json_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = Agent::new(Fake::default(), tmp.path().join("rooms"));
+        let r = room("!a:example.org");
+        agent.record(&r, None, "@kas:x", "hi").await.unwrap();
+        agent
+            .record(&r, Some("$t"), "agent", "hello\nthere")
+            .await
+            .unwrap();
+        let text =
+            std::fs::read_to_string(tmp.path().join("rooms/!a:example.org/transcript.jsonl"))
+                .unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["sender"], "@kas:x");
+        assert!(lines[0]["thread"].is_null());
+        assert_eq!(lines[1]["thread"], "$t");
+        assert_eq!(lines[1]["body"], "hello\nthere");
+    }
+
+    #[tokio::test]
+    async fn restart_request_is_consumed_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = Agent::new(Fake::default(), tmp.path().join("rooms"));
+        assert!(!agent.take_restart_request());
+        std::fs::write(tmp.path().join("restart"), "").unwrap();
+        assert!(agent.take_restart_request());
+        assert!(!agent.take_restart_request());
     }
 }
