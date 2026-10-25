@@ -1,10 +1,10 @@
 //! parley — a Matrix bot that lets people talk to home-lab agents.
 //!
-//! Step 1 is an end-to-end encrypted echo: the bot joins rooms it is invited
-//! to (only by people on the allow list) and answers every text message with
-//! the same text. The bot is an ordinary room member with its own device, so
-//! it receives the room keys like any other member and can read encrypted
-//! rooms while the server cannot.
+//! The bot joins rooms it is invited to (only by people on the allow list)
+//! and answers every text message with an agent run (see `agent.rs`). The
+//! bot is an ordinary room member with its own device, so it receives the
+//! room keys like any other member and can read encrypted rooms while the
+//! server cannot.
 //!
 //! Configuration (environment):
 //!   PARLEY_HOMESERVER     default https://chat.lab.artintel.ai
@@ -13,24 +13,39 @@
 //!                         session is reused)
 //!   PARLEY_ALLOWED        comma-separated user IDs allowed to invite the bot
 //!   PARLEY_DATA_DIR       default <data dir>/parley
+//!   PARLEY_CLAUDE         the claude program, default `claude`
+//!
+//! Each room's system prompt is `PARLEY_DATA_DIR/rooms/<room id>/SYSTEM.md`,
+//! written with a default on the room's first message. Edit it any time; the
+//! next message uses the new text.
 //!
 //! Verification: start "Verify" on @agent in Element. The bot accepts
 //! requests from people on the allow list and prints the emoji to its log.
 //! The bot confirms its side by itself; *you* are the check: compare the log
 //! with what Element shows, and only press "They match" if they do.
 //!
-//! State lives in PARLEY_DATA_DIR: `session.json` (access token, device ID)
+//! Other state in PARLEY_DATA_DIR: `session.json` (access token, device ID)
 //! and `store/` (encrypted SQLite with the bot's encryption keys). Losing the
 //! store means losing the keys: delete both and log in again as a new device.
 
-use std::{env, path::PathBuf};
+mod agent;
+mod breaker;
+
+use std::{
+    env,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use matrix_sdk::{
     Client, Room, RoomState,
     authentication::matrix::MatrixSession,
+    LoopCtrl,
     config::SyncSettings,
+    event_handler::Ctx,
     encryption::{
         CrossSigningResetAuthType,
         verification::{
@@ -40,7 +55,7 @@ use matrix_sdk::{
     },
     ruma::{
         OwnedUserId,
-        api::client::uiaa,
+        api::{client::uiaa, error::ErrorKind},
         events::key::verification::request::ToDeviceKeyVerificationRequestEvent,
         events::room::{
             member::StrippedRoomMemberEvent,
@@ -49,6 +64,11 @@ use matrix_sdk::{
     },
 };
 use serde::{Deserialize, Serialize};
+
+use crate::{
+    agent::{Agent, ClaudeCode},
+    breaker::{Breaker, State},
+};
 
 /// What we save after the first login, so every later start is the same device.
 #[derive(Serialize, Deserialize)]
@@ -64,6 +84,7 @@ struct Config {
     password_file: Option<PathBuf>,
     allowed: Vec<OwnedUserId>,
     data_dir: PathBuf,
+    claude: String,
 }
 
 impl Config {
@@ -85,6 +106,7 @@ impl Config {
             password_file: env::var_os("PARLEY_PASSWORD_FILE").map(Into::into),
             allowed,
             data_dir,
+            claude: env::var("PARLEY_CLAUDE").unwrap_or_else(|_| "claude".into()),
         })
     }
 }
@@ -117,7 +139,7 @@ async fn main() -> Result<()> {
         first_login(&config, &session_file, &store_dir).await?
     };
 
-    // Catch up once without handlers, so old messages are not echoed again.
+    // Catch up once without handlers, so old messages are not answered again.
     let response = client.sync_once(SyncSettings::default()).await?;
 
     let allowed = config.allowed.clone();
@@ -125,6 +147,11 @@ async fn main() -> Result<()> {
         let allowed = allowed.clone();
         async move { on_invite(ev, client, room, &allowed).await }
     });
+    let agent = Agent::new(
+        ClaudeCode { program: config.claude.clone(), timeout: Duration::from_secs(300) },
+        config.data_dir.join("rooms"),
+    );
+    client.add_event_handler_context(Arc::new(agent));
     client.add_event_handler(on_message);
     let allowed = config.allowed.clone();
     client.add_event_handler(move |ev: ToDeviceKeyVerificationRequestEvent, client: Client| {
@@ -145,22 +172,62 @@ async fn main() -> Result<()> {
     });
 
     println!("listening");
-    // A dropped connection (lab restart, VPN switch, Wi-Fi change) ends a
-    // sync with an error. Keep going: the client remembers where it was, so
-    // nothing is missed or echoed twice. Back off up to a minute.
-    let mut settings = SyncSettings::default().token(response.next_batch);
-    let mut delay = std::time::Duration::from_secs(1);
-    loop {
-        match client.sync(settings.clone()).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                eprintln!("sync failed: {e}; retrying in {}s", delay.as_secs());
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(std::time::Duration::from_secs(60));
-                settings = SyncSettings::default();
+    sync_forever(&client, SyncSettings::default().token(response.next_batch)).await
+}
+
+/// Sync until the access token stops working.
+///
+/// The SDK's sync stream keeps its place between calls, so a failed request
+/// loses nothing. Failures back off (1, 2, 4, 8 s); after 5 in a row the
+/// circuit opens and the bot waits 5 minutes before one probe. A revoked or
+/// unknown token is not retried: that needs a new login, not patience.
+async fn sync_forever(client: &Client, settings: SyncSettings) -> Result<()> {
+    let breaker = Arc::new(Mutex::new(Breaker::new(5, Duration::from_secs(300))));
+    client
+        .sync_with_result_callback(settings, |result| {
+            let breaker = breaker.clone();
+            async move {
+                let wait = match result {
+                    Ok(_) => {
+                        let mut b = breaker.lock().unwrap();
+                        if b.failures() > 0 {
+                            println!("sync recovered after {} failures", b.failures());
+                        }
+                        b.success();
+                        return Ok(LoopCtrl::Continue);
+                    }
+                    Err(e) => {
+                        if let Some(ErrorKind::UnknownToken(_)) = e.client_api_error_kind() {
+                            eprintln!("access token rejected; log in again");
+                            return Err(e);
+                        }
+                        let mut b = breaker.lock().unwrap();
+                        let opened = b.failure();
+                        match b.state() {
+                            State::Open(left) => {
+                                if opened {
+                                    eprintln!(
+                                        "sync circuit open after {} failures ({e}); next try in {}s",
+                                        b.failures(),
+                                        left.as_secs()
+                                    );
+                                }
+                                left
+                            }
+                            _ => {
+                                let wait = Duration::from_secs(1 << (b.failures() - 1).min(3));
+                                eprintln!("sync failed ({e}); retrying in {}s", wait.as_secs());
+                                wait
+                            }
+                        }
+                    }
+                };
+                tokio::time::sleep(wait).await;
+                Ok(LoopCtrl::Continue)
             }
-        }
-    }
+        })
+        .await?;
+    Ok(())
 }
 
 /// Log in with the password once, save the session, and set up cross-signing
@@ -229,8 +296,13 @@ async fn on_invite(ev: StrippedRoomMemberEvent, client: Client, room: Room, allo
     }
 }
 
-/// Echo every text message from someone else.
-async fn on_message(ev: OriginalSyncRoomMessageEvent, room: Room, client: Client) {
+/// Answer every text message from someone else with an agent run.
+async fn on_message(
+    ev: OriginalSyncRoomMessageEvent,
+    room: Room,
+    client: Client,
+    Ctx(agent): Ctx<Arc<Agent<ClaudeCode>>>,
+) {
     if room.state() != RoomState::Joined || Some(ev.sender.as_ref()) == client.user_id() {
         return;
     }
@@ -246,10 +318,31 @@ async fn on_message(ev: OriginalSyncRoomMessageEvent, room: Room, client: Client
     }
     let MessageType::Text(text) = &ev.content.msgtype else { return };
     println!("[{}] {}: {}", room.room_id(), ev.sender, text.body);
-    let reply = RoomMessageEventContent::text_plain(format!("echo: {}", text.body));
-    if let Err(e) = room.send(reply).await {
-        eprintln!("send failed: {e}");
-    }
+    let body = text.body.clone();
+
+    // Runs take seconds; don't hold up the sync loop meanwhile.
+    tokio::spawn(async move {
+        let sender = match room.get_member_no_sync(&ev.sender).await {
+            Ok(Some(member)) => member.name().to_owned(),
+            _ => ev.sender.localpart().to_owned(),
+        };
+
+        // Show "typing…" until the answer is there (a notice lasts ~4 s).
+        let typing_room = room.clone();
+        let typing = tokio::spawn(async move {
+            loop {
+                let _ = typing_room.typing_notice(true).await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        });
+        let answer = agent.reply(room.room_id(), &sender, &body).await;
+        typing.abort();
+        let _ = room.typing_notice(false).await;
+
+        if let Err(e) = room.send(RoomMessageEventContent::text_markdown(answer)).await {
+            eprintln!("send failed: {e}");
+        }
+    });
 }
 
 /// Accept a verification request and drive it through emoji (SAS) comparison.
