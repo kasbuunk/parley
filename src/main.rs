@@ -408,8 +408,12 @@ async fn on_message(
 
         if is_new {
             let text = match agent.reset(room.room_id(), thread_id.as_deref()).await {
-                Ok(true) => "_New session: the next message starts fresh._".to_owned(),
-                Ok(false) => {
+                Ok(Some(old)) => match old.messages {
+                    Some(1) => "_New session (the old one had 1 message): the next message starts fresh._".to_owned(),
+                    Some(n) => format!("_New session (the old one had {n} messages): the next message starts fresh._"),
+                    None => "_New session (the old one's message count is unknown): the next message starts fresh._".to_owned(),
+                },
+                Ok(None) => {
                     "_There was no session yet; the next message starts fresh._".to_owned()
                 }
                 Err(e) => format!("_Could not reset the session: {e}_"),

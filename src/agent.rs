@@ -8,7 +8,9 @@
 //! - `session`: the harness session ID for the room's main timeline, when
 //!   the profile says `resume`; `threads/<root event id>.session` for each
 //!   Matrix thread. A thread is its own conversation, so unrelated topics
-//!   don't share one context. `!new` clears the session it is sent in.
+//!   don't share one context. The file holds the ID, then on a second
+//!   line how many messages the session has had. `!new` clears the
+//!   session it is sent in and says how many messages it had.
 //!   With `threads`, every main-timeline message starts a new thread.
 //!
 //! - `transcript.jsonl`: every text message in the room and every reply,
@@ -116,6 +118,37 @@ pub struct Output {
     pub text: String,
     /// Session ID to continue next time, if the harness keeps sessions.
     pub session: Option<String>,
+}
+
+/// A session file: the harness session ID and how many messages it has had.
+#[derive(Debug, Default, PartialEq)]
+pub struct Saved {
+    pub id: String,
+    /// `None` for files written before parley counted messages.
+    pub messages: Option<u64>,
+}
+
+impl Saved {
+    async fn read(file: &Path) -> Option<Self> {
+        let text = tokio::fs::read_to_string(file).await.ok()?;
+        let mut lines = text.lines();
+        let id = lines.next()?.trim().to_owned();
+        if id.is_empty() {
+            return None;
+        }
+        let messages = lines.next().and_then(|l| l.trim().parse().ok());
+        Some(Self { id, messages })
+    }
+}
+
+impl std::fmt::Display for Saved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}", self.id)?;
+        if let Some(n) = self.messages {
+            writeln!(f, "{n}")?;
+        }
+        Ok(())
+    }
 }
 
 pub trait Harness: Send + Sync {
@@ -265,12 +298,14 @@ impl<H: Harness> Agent<H> {
     }
 
     /// Forget the session of the room's main timeline, or of one thread.
-    /// Returns whether there was one.
-    pub async fn reset(&self, room_id: &RoomId, thread: Option<&str>) -> Result<bool> {
+    /// Returns `None` if there was none, else the session's message count
+    /// (unknown for sessions saved before parley counted them).
+    pub async fn reset(&self, room_id: &RoomId, thread: Option<&str>) -> Result<Option<Saved>> {
         let file = self.session_file(&self.room_dir(room_id)?, thread)?;
+        let saved = Saved::read(&file).await;
         match tokio::fs::remove_file(&file).await {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Ok(()) => Ok(Some(saved.unwrap_or_default())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
@@ -393,14 +428,12 @@ impl<H: Harness> Agent<H> {
         };
 
         let session_file = self.session_file(&dir, thread)?;
-        let session = if profile.resume {
-            tokio::fs::read_to_string(&session_file)
-                .await
-                .ok()
-                .map(|s| s.trim().to_owned())
+        let saved = if profile.resume {
+            Saved::read(&session_file).await
         } else {
             None
         };
+        let session = saved.as_ref().map(|s| s.id.clone());
 
         let input = format!("[{sender}] {body}");
         let workdir = profile.workdir.clone().unwrap_or_else(|| dir.clone());
@@ -417,7 +450,17 @@ impl<H: Harness> Agent<H> {
                     if let Some(parent) = session_file.parent() {
                         tokio::fs::create_dir_all(parent).await?;
                     }
-                    tokio::fs::write(&session_file, id).await?;
+                    // A resumed session may come back under a new ID; it is
+                    // still the same conversation, so the count carries on.
+                    let messages = match &saved {
+                        Some(s) => s.messages.map(|n| n + 1),
+                        None => Some(1),
+                    };
+                    let saved = Saved {
+                        id: id.clone(),
+                        messages,
+                    };
+                    tokio::fs::write(&session_file, saved.to_string()).await?;
                 }
                 Ok(out.text)
             }
@@ -950,14 +993,41 @@ echo '{{"result":"ok"}}'"#,
         agent.reply(&r, None, "Kas", "one", &[]).await;
         agent.reply(&r, Some("$t1"), "Kas", "two", &[]).await;
 
-        assert!(agent.reset(&r, None).await.unwrap());
-        assert!(!agent.reset(&r, None).await.unwrap()); // nothing left to clear
+        assert!(agent.reset(&r, None).await.unwrap().is_some());
+        assert!(agent.reset(&r, None).await.unwrap().is_none()); // nothing left to clear
         agent.reply(&r, None, "Kas", "fresh", &[]).await;
         agent.reply(&r, Some("$t1"), "Kas", "still", &[]).await;
 
         let calls = agent.harness.calls();
         assert_eq!(calls[2].session, None); // main started over
         assert_eq!(calls[3].session.as_deref(), Some("sess-2")); // thread kept
+    }
+
+    #[tokio::test]
+    async fn reset_reports_the_message_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        resume_room(tmp.path(), "!a:example.org");
+        let agent = Agent::new(Fake::default(), tmp.path().to_owned());
+        let r = room("!a:example.org");
+        for body in ["one", "two", "three"] {
+            agent.reply(&r, None, "Kas", body, &[]).await;
+        }
+        let cleared = agent.reset(&r, None).await.unwrap().unwrap();
+        assert_eq!(cleared.messages, Some(3));
+    }
+
+    #[tokio::test]
+    async fn legacy_session_file_resumes_with_unknown_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        resume_room(tmp.path(), "!a:example.org");
+        let dir = tmp.path().join("!a:example.org");
+        std::fs::write(dir.join("session"), "old-id").unwrap();
+        let agent = Agent::new(Fake::default(), tmp.path().to_owned());
+        let r = room("!a:example.org");
+        agent.reply(&r, None, "Kas", "hi", &[]).await;
+        assert_eq!(agent.harness.calls()[0].session.as_deref(), Some("old-id"));
+        let cleared = agent.reset(&r, None).await.unwrap().unwrap();
+        assert_eq!(cleared.messages, None);
     }
 
     #[tokio::test]
