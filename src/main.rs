@@ -89,13 +89,9 @@ struct Config {
 
 impl Config {
     fn from_env() -> Result<Self> {
-        let allowed = env::var("PARLEY_ALLOWED")
-            .unwrap_or_else(|_| {
-                "@kas:chat.lab.artintel.ai,@camille:chat.lab.artintel.ai".into()
-            })
-            .split(',')
-            .map(|s| s.trim().try_into().with_context(|| format!("bad user ID {s:?}")))
-            .collect::<Result<_>>()?;
+        let allowed = parse_allowed(&env::var("PARLEY_ALLOWED").unwrap_or_else(|_| {
+            "@kas:chat.lab.artintel.ai,@camille:chat.lab.artintel.ai".into()
+        }))?;
         let data_dir = match env::var_os("PARLEY_DATA_DIR") {
             Some(d) => d.into(),
             None => dirs::data_dir().context("no data dir")?.join("parley"),
@@ -109,6 +105,19 @@ impl Config {
             claude: env::var("PARLEY_CLAUDE").unwrap_or_else(|_| "claude".into()),
         })
     }
+}
+
+/// The user IDs in a comma-separated `PARLEY_ALLOWED` value.
+fn parse_allowed(list: &str) -> Result<Vec<OwnedUserId>> {
+    list.split(',')
+        .map(|s| s.trim().try_into().with_context(|| format!("bad user ID {s:?}")))
+        .collect()
+}
+
+/// How long to wait after the `failures`-th sync failure in a row (≥ 1):
+/// 1, 2, 4, 8 s, then 8 s.
+fn sync_backoff(failures: u32) -> Duration {
+    Duration::from_secs(1 << (failures - 1).min(3))
 }
 
 #[tokio::main]
@@ -215,7 +224,7 @@ async fn sync_forever(client: &Client, settings: SyncSettings) -> Result<()> {
                                 left
                             }
                             _ => {
-                                let wait = Duration::from_secs(1 << (b.failures() - 1).min(3));
+                                let wait = sync_backoff(b.failures());
                                 eprintln!("sync failed ({e}); retrying in {}s", wait.as_secs());
                                 wait
                             }
@@ -410,4 +419,50 @@ fn write_private(path: &PathBuf, contents: &str) -> Result<()> {
     let mut f = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
     f.write_all(contents.as_bytes())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_backoff_doubles_up_to_eight_seconds() {
+        let waits: Vec<u64> = (1..=7).map(|n| sync_backoff(n).as_secs()).collect();
+        assert_eq!(waits, [1, 2, 4, 8, 8, 8, 8]);
+        assert_eq!(sync_backoff(u32::MAX), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn parse_allowed_reads_the_default_list() {
+        let allowed =
+            parse_allowed("@kas:chat.lab.artintel.ai,@camille:chat.lab.artintel.ai").unwrap();
+        let ids: Vec<&str> = allowed.iter().map(|u| u.as_str()).collect();
+        assert_eq!(ids, ["@kas:chat.lab.artintel.ai", "@camille:chat.lab.artintel.ai"]);
+    }
+
+    #[test]
+    fn parse_allowed_trims_whitespace() {
+        let allowed = parse_allowed(" @a:example.org ,\t@b:example.org\n").unwrap();
+        let ids: Vec<&str> = allowed.iter().map(|u| u.as_str()).collect();
+        assert_eq!(ids, ["@a:example.org", "@b:example.org"]);
+    }
+
+    #[test]
+    fn parse_allowed_single_id() {
+        let allowed = parse_allowed("@a:example.org").unwrap();
+        assert_eq!(allowed.len(), 1);
+    }
+
+    #[test]
+    fn parse_allowed_rejects_a_bad_id_and_names_it() {
+        let err = parse_allowed("@a:example.org,kas").unwrap_err();
+        assert!(format!("{err}").contains("\"kas\""), "{err}");
+    }
+
+    #[test]
+    fn parse_allowed_rejects_empty_entries() {
+        // An empty value or a trailing comma is an error, not "nobody allowed".
+        assert!(parse_allowed("").is_err());
+        assert!(parse_allowed("@a:example.org,").is_err());
+    }
 }

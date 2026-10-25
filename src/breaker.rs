@@ -83,4 +83,71 @@ mod tests {
         assert!(matches!(b.state(), State::HalfOpen));
         assert!(b.failure()); // probe failed: open again
     }
+
+    #[test]
+    fn threshold_one_opens_on_first_failure() {
+        let mut b = Breaker::new(1, Duration::from_secs(60));
+        assert!(matches!(b.state(), State::Closed));
+        assert!(b.failure());
+        assert!(matches!(b.state(), State::Open(_)));
+        assert_eq!(b.failures(), 1);
+    }
+
+    #[test]
+    fn failures_keep_counting_past_threshold() {
+        let mut b = Breaker::new(2, Duration::from_secs(60));
+        assert!(!b.failure());
+        assert!(b.failure());
+        // Every further failure reopens (and reports it) and is counted.
+        assert!(b.failure());
+        assert!(b.failure());
+        assert_eq!(b.failures(), 4);
+        assert!(matches!(b.state(), State::Open(_)));
+    }
+
+    #[test]
+    fn success_after_half_open_closes() {
+        let mut b = Breaker::new(2, Duration::ZERO);
+        b.failure();
+        b.failure();
+        assert!(matches!(b.state(), State::HalfOpen));
+        b.success();
+        assert!(matches!(b.state(), State::Closed));
+        assert_eq!(b.failures(), 0);
+        // Closed again means a fresh count: one failure does not reopen.
+        assert!(!b.failure());
+        assert!(matches!(b.state(), State::Closed));
+    }
+
+    #[test]
+    fn open_remaining_is_at_most_cooldown() {
+        let cooldown = Duration::from_secs(300);
+        let mut b = Breaker::new(1, cooldown);
+        b.failure();
+        match b.state() {
+            State::Open(left) => {
+                assert!(left <= cooldown);
+                assert!(left > cooldown - Duration::from_secs(5));
+            }
+            _ => panic!("expected open"),
+        }
+    }
+
+    #[test]
+    fn reopening_restarts_the_cooldown() {
+        let mut b = Breaker::new(1, Duration::from_millis(30));
+        b.failure();
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(matches!(b.state(), State::HalfOpen));
+        assert!(b.failure());
+        assert!(matches!(b.state(), State::Open(_)));
+    }
+
+    #[test]
+    fn zero_threshold_opens_on_first_failure() {
+        // Degenerate config: behaves like threshold 1.
+        let mut b = Breaker::new(0, Duration::from_secs(60));
+        assert!(matches!(b.state(), State::Closed));
+        assert!(b.failure());
+    }
 }
