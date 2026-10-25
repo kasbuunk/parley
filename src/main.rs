@@ -41,7 +41,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use matrix_sdk::{
-    Client, Room, RoomState,
+    Client, Room, RoomMemberships, RoomState,
     authentication::matrix::MatrixSession,
     LoopCtrl,
     config::SyncSettings,
@@ -157,7 +157,7 @@ async fn main() -> Result<()> {
         async move { on_invite(ev, client, room, &allowed).await }
     });
     let agent = Agent::new(
-        ClaudeCode { program: config.claude.clone(), timeout: Duration::from_secs(300) },
+        ClaudeCode { program: config.claude.clone() },
         config.data_dir.join("rooms"),
     );
     client.add_event_handler_context(Arc::new(agent));
@@ -328,6 +328,7 @@ async fn on_message(
     let MessageType::Text(text) = &ev.content.msgtype else { return };
     println!("[{}] {}: {}", room.room_id(), ev.sender, text.body);
     let body = text.body.clone();
+    let me = client.user_id().map(ToOwned::to_owned);
 
     // Runs take seconds; don't hold up the sync loop meanwhile.
     tokio::spawn(async move {
@@ -344,7 +345,21 @@ async fn on_message(
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
         });
-        let answer = agent.reply(room.room_id(), &sender, &body).await;
+        // Everyone who is or may soon be in the room, except the bot.
+        let members: Vec<OwnedUserId> = match room.members(RoomMemberships::ACTIVE).await {
+            Ok(list) => list
+                .iter()
+                .map(|m| m.user_id().to_owned())
+                .filter(|id| Some(id) != me.as_ref())
+                .collect(),
+            Err(e) => {
+                eprintln!("could not list members: {e}");
+                let _ = room.send(RoomMessageEventContent::text_plain("Could not check who is in this room; not running.")).await;
+                typing.abort();
+                return;
+            }
+        };
+        let answer = agent.reply(room.room_id(), &sender, &body, &members).await;
         typing.abort();
         let _ = room.typing_notice(false).await;
 

@@ -1,12 +1,14 @@
 //! Turning a room message into an agent reply.
 //!
-//! Step 2 (v0): every room has a folder `rooms/<room id>/` with a
-//! `SYSTEM.md`. Each message starts a fresh agent run with that system prompt
-//! and the message (prefixed with the sender's name) as its only user turn.
-//! No history, no tools, no data. The folder is the run's working directory,
-//! so later steps can put context there (AGENTS.md, files, a transcript).
+//! Every room has a folder `rooms/<room id>/` holding:
+//! - `SYSTEM.md`: the system prompt (a default is written on first use);
+//! - `room.toml`: optional profile: where the agent runs, which tools and
+//!   settings it gets, who may be in the room, whether it keeps a session.
+//!   Without it a room is locked down: no tools, no settings, no memory.
+//! - `session`: the harness session ID, when the profile says `resume`.
 //!
-//! The model and harness sit behind [`Harness`]; Claude Code is the first
+//! Each message (prefixed with the sender's name) is one user turn. The
+//! model and harness sit behind [`Harness`]; Claude Code is the first
 //! implementation, Pi can be a second.
 
 use std::{
@@ -18,7 +20,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use matrix_sdk::ruma::{OwnedRoomId, RoomId};
+use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId, RoomId};
+use serde::Deserialize;
 use tokio::{process::Command, sync::Mutex};
 
 use crate::breaker::{Breaker, State};
@@ -36,33 +39,123 @@ Answer briefly, in the language of the message. Your answer is posted to the \
 room as Markdown.
 ";
 
-/// One agent run: a system prompt, a working directory, one user turn.
-pub trait Harness: Send + Sync {
-    fn run(
-        &self,
-        system_prompt: &str,
-        workdir: &Path,
-        input: &str,
-    ) -> impl Future<Output = Result<String>> + Send;
+/// A room's `room.toml`. Every field is optional; the defaults are the
+/// locked-down room.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Profile {
+    /// Where the agent runs. Default: the room's own folder.
+    pub workdir: Option<PathBuf>,
+    /// Built-in tools: "" for none, "default" for all, or a list like "Read,Grep".
+    pub tools: String,
+    /// Claude Code setting sources to load: "user", "project", "local".
+    /// With "project", a repo's CLAUDE.md and .claude/ apply.
+    pub settings: Vec<String>,
+    /// Load the user's MCP servers too.
+    pub mcp: bool,
+    /// For example "bypassPermissions": tool calls run without asking.
+    pub permission_mode: Option<String>,
+    /// If set, the agent only runs while every member of the room is listed.
+    pub members: Option<Vec<OwnedUserId>>,
+    /// Keep one session per room, so the agent remembers the conversation.
+    pub resume: bool,
+    /// Whether SYSTEM.md replaces the harness's own system prompt or is
+    /// appended to it.
+    pub prompt: PromptMode,
+    pub model: Option<String>,
+    pub timeout_secs: u64,
 }
 
-/// Claude Code in headless mode, on the logged-in subscription.
-///
-/// Locked down: no tools, no MCP servers, no user/project settings (so no
-/// hooks or CLAUDE.md), no slash commands, nothing saved as a session.
+impl Default for Profile {
+    fn default() -> Self {
+        Self {
+            workdir: None,
+            tools: String::new(),
+            settings: Vec::new(),
+            mcp: false,
+            permission_mode: None,
+            members: None,
+            resume: false,
+            prompt: PromptMode::Replace,
+            model: None,
+            timeout_secs: 300,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptMode {
+    Replace,
+    Append,
+}
+
+/// One agent run.
+pub struct Run<'a> {
+    pub profile: &'a Profile,
+    pub system_prompt: &'a str,
+    pub workdir: &'a Path,
+    pub input: &'a str,
+    /// Session to continue, if any.
+    pub session: Option<&'a str>,
+}
+
+pub struct Output {
+    pub text: String,
+    /// Session ID to continue next time, if the harness keeps sessions.
+    pub session: Option<String>,
+}
+
+pub trait Harness: Send + Sync {
+    fn run(&self, run: &Run<'_>) -> impl Future<Output = Result<Output>> + Send;
+}
+
+/// Claude Code in headless mode, on the logged-in subscription. It never
+/// asks questions: whatever the profile does not allow is refused.
 pub struct ClaudeCode {
     pub program: String,
-    pub timeout: Duration,
+}
+
+impl ClaudeCode {
+    fn args(run: &Run<'_>) -> Vec<String> {
+        let p = run.profile;
+        let mut args: Vec<String> = vec!["-p".into(), run.input.into()];
+        args.push(match p.prompt {
+            PromptMode::Replace => "--system-prompt".into(),
+            PromptMode::Append => "--append-system-prompt".into(),
+        });
+        args.push(run.system_prompt.into());
+        args.extend(["--tools".into(), p.tools.clone()]);
+        if !p.mcp {
+            args.push("--strict-mcp-config".into());
+        }
+        args.extend(["--setting-sources".into(), p.settings.join(",")]);
+        if p.settings.is_empty() {
+            args.push("--disable-slash-commands".into());
+        }
+        if !p.resume {
+            args.push("--no-session-persistence".into());
+        }
+        if let Some(mode) = &p.permission_mode {
+            args.extend(["--permission-mode".into(), mode.clone()]);
+        }
+        if let Some(model) = &p.model {
+            args.extend(["--model".into(), model.clone()]);
+        }
+        if let Some(session) = run.session {
+            args.extend(["--resume".into(), session.into()]);
+        }
+        args.extend(["--output-format".into(), "json".into()]);
+        args
+    }
 }
 
 impl Harness for ClaudeCode {
-    async fn run(&self, system_prompt: &str, workdir: &Path, input: &str) -> Result<String> {
+    async fn run(&self, run: &Run<'_>) -> Result<Output> {
+        let timeout = Duration::from_secs(run.profile.timeout_secs);
         let child = Command::new(&self.program)
-            .args(["-p", input, "--system-prompt", system_prompt])
-            .args(["--tools", "", "--strict-mcp-config", "--setting-sources", ""])
-            .args(["--disable-slash-commands", "--no-session-persistence"])
-            .args(["--output-format", "json"])
-            .current_dir(workdir)
+            .args(Self::args(run))
+            .current_dir(run.workdir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -70,15 +163,16 @@ impl Harness for ClaudeCode {
             .spawn()
             .with_context(|| format!("could not start {}", self.program))?;
 
-        let output = tokio::time::timeout(self.timeout, child.wait_with_output())
+        let output = tokio::time::timeout(timeout, child.wait_with_output())
             .await
-            .with_context(|| format!("no answer within {}s", self.timeout.as_secs()))??;
+            .with_context(|| format!("no answer within {}s", timeout.as_secs()))??;
 
-        #[derive(serde::Deserialize)]
+        #[derive(Deserialize)]
         struct Reply {
             result: Option<String>,
             #[serde(default)]
             is_error: bool,
+            session_id: Option<String>,
         }
         let reply: Reply = serde_json::from_slice(&output.stdout).with_context(|| {
             format!(
@@ -88,7 +182,7 @@ impl Harness for ClaudeCode {
             )
         })?;
         match reply.result {
-            Some(text) if !reply.is_error => Ok(text),
+            Some(text) if !reply.is_error => Ok(Output { text, session: reply.session_id }),
             other => bail!("claude reported an error: {}", other.unwrap_or_default()),
         }
     }
@@ -112,8 +206,15 @@ impl<H: Harness> Agent<H> {
         }
     }
 
-    /// The reply to post for `body`, sent by `sender` in `room_id`.
-    pub async fn reply(&self, room_id: &RoomId, sender: &str, body: &str) -> String {
+    /// The reply to post for `body`, sent by `sender` in `room_id`, whose
+    /// human members (everyone but the bot) are `members`.
+    pub async fn reply(
+        &self,
+        room_id: &RoomId,
+        sender: &str,
+        body: &str,
+        members: &[OwnedUserId],
+    ) -> String {
         let lock = self.room_locks.lock().unwrap().entry(room_id.to_owned()).or_default().clone();
         let _turn = lock.lock().await;
 
@@ -124,7 +225,7 @@ impl<H: Harness> Agent<H> {
             );
         }
 
-        match self.run(room_id, sender, body).await {
+        match self.run(room_id, sender, body, members).await {
             Ok(text) => {
                 self.breaker.lock().unwrap().success();
                 text
@@ -140,9 +241,41 @@ impl<H: Harness> Agent<H> {
         }
     }
 
-    async fn run(&self, room_id: &RoomId, sender: &str, body: &str) -> Result<String> {
-        let dir = self.rooms_dir.join(room_id.as_str());
+    async fn run(
+        &self,
+        room_id: &RoomId,
+        sender: &str,
+        body: &str,
+        members: &[OwnedUserId],
+    ) -> Result<String> {
+        // Room IDs come from the homeserver; still, never let one name a
+        // folder outside rooms/.
+        let id = room_id.as_str();
+        if id.contains('/') || id.contains("..") {
+            bail!("refusing room ID {id:?}");
+        }
+        let dir = self.rooms_dir.join(id);
         tokio::fs::create_dir_all(&dir).await?;
+
+        let profile = match tokio::fs::read_to_string(dir.join("room.toml")).await {
+            Ok(text) => toml::from_str(&text).context("room.toml is invalid")?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Profile::default(),
+            Err(e) => return Err(e).context("could not read room.toml"),
+        };
+
+        // Fail closed: a capable room stops working as soon as someone
+        // who is not on its list is in it.
+        if let Some(allowed) = &profile.members {
+            let strangers: Vec<_> = members.iter().filter(|m| !allowed.contains(m)).collect();
+            if !strangers.is_empty() {
+                let names: Vec<_> = strangers.iter().map(|m| m.as_str()).collect();
+                return Ok(format!(
+                    "_Not running: this room's profile does not allow {}._",
+                    names.join(", ")
+                ));
+            }
+        }
+
         let prompt_file = dir.join("SYSTEM.md");
         let system_prompt = match tokio::fs::read_to_string(&prompt_file).await {
             Ok(text) => text,
@@ -154,7 +287,39 @@ impl<H: Harness> Agent<H> {
             }
             Err(e) => return Err(e).context("could not read SYSTEM.md"),
         };
-        self.harness.run(&system_prompt, &dir, &format!("[{sender}] {body}")).await
+
+        let session_file = dir.join("session");
+        let session = if profile.resume {
+            tokio::fs::read_to_string(&session_file).await.ok().map(|s| s.trim().to_owned())
+        } else {
+            None
+        };
+
+        let input = format!("[{sender}] {body}");
+        let workdir = profile.workdir.clone().unwrap_or_else(|| dir.clone());
+        let run = Run {
+            profile: &profile,
+            system_prompt: &system_prompt,
+            workdir: &workdir,
+            input: &input,
+            session: session.as_deref(),
+        };
+        match self.harness.run(&run).await {
+            Ok(out) => {
+                if let (true, Some(id)) = (profile.resume, &out.session) {
+                    tokio::fs::write(&session_file, id).await?;
+                }
+                Ok(out.text)
+            }
+            Err(e) => {
+                if session.is_some() {
+                    // A broken session would fail every turn; start over next time.
+                    let _ = tokio::fs::remove_file(&session_file).await;
+                    return Err(e.context("session reset; the next message starts fresh"));
+                }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -180,8 +345,24 @@ mod tests {
         path.to_str().unwrap().to_owned()
     }
 
-    fn claude(program: String, timeout: Duration) -> ClaudeCode {
-        ClaudeCode { program, timeout }
+    /// A fake-program harness plus the timeout its runs get.
+    struct Cc(ClaudeCode, Duration);
+
+    fn claude(program: String, timeout: Duration) -> Cc {
+        Cc(ClaudeCode { program }, timeout)
+    }
+
+    impl Cc {
+        /// Run with the default (locked-down) profile. Profiles count
+        /// whole seconds; tests want less, so the timeout is applied here.
+        async fn run(&self, system_prompt: &str, workdir: &Path, input: &str) -> Result<String> {
+            let profile = Profile { timeout_secs: 60, ..Profile::default() };
+            let run = Run { profile: &profile, system_prompt, workdir, input, session: None };
+            match tokio::time::timeout(self.1, self.0.run(&run)).await {
+                Ok(r) => r.map(|o| o.text),
+                Err(_) => bail!("no answer within {:?}", self.1),
+            }
+        }
     }
 
     #[tokio::test]
@@ -308,10 +489,11 @@ echo '{{"result":"ok"}}'"#,
     }
 
     impl Harness for Fake {
-        async fn run(&self, system_prompt: &str, workdir: &Path, input: &str) -> Result<String> {
+        async fn run(&self, run: &Run<'_>) -> Result<Output> {
+            let input = run.input;
             self.calls.lock().unwrap().push(Call {
-                system_prompt: system_prompt.to_owned(),
-                workdir: workdir.to_owned(),
+                system_prompt: run.system_prompt.to_owned(),
+                workdir: run.workdir.to_owned(),
                 input: input.to_owned(),
             });
             if self.sleepy {
@@ -320,7 +502,8 @@ echo '{{"result":"ok"}}'"#,
                 tokio::time::sleep(Duration::from_millis(n.parse().unwrap())).await;
                 self.log.lock().unwrap().push(format!("end {n}"));
             }
-            self.results.lock().unwrap().pop_front().unwrap_or_else(|| Ok("ok".into()))
+            let text = self.results.lock().unwrap().pop_front().unwrap_or_else(|| Ok("ok".into()))?;
+            Ok(Output { text, session: None })
         }
     }
 
@@ -329,7 +512,7 @@ echo '{{"result":"ok"}}'"#,
         let tmp = tempfile::tempdir().unwrap();
         let agent = Agent::new(Fake::default(), tmp.path().join("rooms"));
         let r = room("!abc:example.org");
-        assert_eq!(agent.reply(&r, "Kas", "hello").await, "ok");
+        assert_eq!(agent.reply(&r, "Kas", "hello", &[]).await, "ok");
 
         let dir = tmp.path().join("rooms").join("!abc:example.org");
         let on_disk = std::fs::read_to_string(dir.join("SYSTEM.md")).unwrap();
@@ -346,9 +529,9 @@ echo '{{"result":"ok"}}'"#,
         let tmp = tempfile::tempdir().unwrap();
         let agent = Agent::new(Fake::default(), tmp.path().to_owned());
         let r = room("!abc:example.org");
-        agent.reply(&r, "Kas", "one").await;
+        agent.reply(&r, "Kas", "one", &[]).await;
         std::fs::write(tmp.path().join(r.as_str()).join("SYSTEM.md"), "Be a pirate.").unwrap();
-        agent.reply(&r, "Camille", "two").await;
+        agent.reply(&r, "Camille", "two", &[]).await;
 
         let calls = agent.harness.calls();
         assert_eq!(calls[1].system_prompt, "Be a pirate.");
@@ -359,8 +542,8 @@ echo '{{"result":"ok"}}'"#,
     async fn rooms_have_separate_folders() {
         let tmp = tempfile::tempdir().unwrap();
         let agent = Agent::new(Fake::default(), tmp.path().to_owned());
-        agent.reply(&room("!a:example.org"), "Kas", "x").await;
-        agent.reply(&room("!b:example.org"), "Kas", "y").await;
+        agent.reply(&room("!a:example.org"), "Kas", "x", &[]).await;
+        agent.reply(&room("!b:example.org"), "Kas", "y", &[]).await;
         let calls = agent.harness.calls();
         assert_ne!(calls[0].workdir, calls[1].workdir);
         assert!(tmp.path().join("!a:example.org/SYSTEM.md").exists());
@@ -371,7 +554,7 @@ echo '{{"result":"ok"}}'"#,
     async fn input_is_sender_in_brackets_then_body() {
         let tmp = tempfile::tempdir().unwrap();
         let agent = Agent::new(Fake::default(), tmp.path().to_owned());
-        agent.reply(&room("!a:example.org"), "Kas Buunk", "multi\nline").await;
+        agent.reply(&room("!a:example.org"), "Kas Buunk", "multi\nline", &[]).await;
         assert_eq!(agent.harness.calls()[0].input, "[Kas Buunk] multi\nline");
     }
 
@@ -379,7 +562,7 @@ echo '{{"result":"ok"}}'"#,
     async fn harness_error_becomes_error_reply() {
         let tmp = tempfile::tempdir().unwrap();
         let agent = Agent::new(Fake::failing(1), tmp.path().to_owned());
-        let reply = agent.reply(&room("!a:example.org"), "Kas", "x").await;
+        let reply = agent.reply(&room("!a:example.org"), "Kas", "x", &[]).await;
         assert_eq!(reply, "_Agent error: fail 0_");
     }
 
@@ -389,13 +572,13 @@ echo '{{"result":"ok"}}'"#,
         let agent = Agent::new(Fake::failing(3), tmp.path().to_owned());
         let r = room("!a:example.org");
         for _ in 0..3 {
-            assert!(agent.reply(&r, "Kas", "x").await.starts_with("_Agent error"));
+            assert!(agent.reply(&r, "Kas", "x", &[]).await.starts_with("_Agent error"));
         }
-        let reply = agent.reply(&r, "Kas", "x").await;
+        let reply = agent.reply(&r, "Kas", "x", &[]).await;
         assert_eq!(reply, "_Agent paused after repeated failures; trying again in 5 min._");
         assert_eq!(agent.harness.calls().len(), 3);
         // The breaker is shared: other rooms are paused too.
-        let other = agent.reply(&room("!b:example.org"), "Kas", "x").await;
+        let other = agent.reply(&room("!b:example.org"), "Kas", "x", &[]).await;
         assert!(other.contains("paused"), "{other}");
         assert_eq!(agent.harness.calls().len(), 3);
     }
@@ -416,7 +599,7 @@ echo '{{"result":"ok"}}'"#,
         let r = room("!a:example.org");
         let mut replies = Vec::new();
         for _ in 0..6 {
-            replies.push(agent.reply(&r, "Kas", "x").await);
+            replies.push(agent.reply(&r, "Kas", "x", &[]).await);
         }
         assert_eq!(replies[2], "fine");
         // Two failures after the success do not open the breaker: call 6 runs.
@@ -434,7 +617,7 @@ echo '{{"result":"ok"}}'"#,
         // Long first, short later: without the room lock they would overlap.
         for ms in ["150", "50", "0"] {
             let (agent, r) = (agent.clone(), r.clone());
-            tasks.push(tokio::spawn(async move { agent.reply(&r, "Kas", ms).await }));
+            tasks.push(tokio::spawn(async move { agent.reply(&r, "Kas", ms, &[]).await }));
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         for t in tasks {
@@ -451,12 +634,12 @@ echo '{{"result":"ok"}}'"#,
             Arc::new(Agent::new(Fake { sleepy: true, ..Default::default() }, tmp.path().to_owned()));
         let a = {
             let agent = agent.clone();
-            tokio::spawn(async move { agent.reply(&room("!a:example.org"), "Kas", "150").await })
+            tokio::spawn(async move { agent.reply(&room("!a:example.org"), "Kas", "150", &[]).await })
         };
         tokio::time::sleep(Duration::from_millis(20)).await;
         let b = {
             let agent = agent.clone();
-            tokio::spawn(async move { agent.reply(&room("!b:example.org"), "Kas", "10").await })
+            tokio::spawn(async move { agent.reply(&room("!b:example.org"), "Kas", "10", &[]).await })
         };
         a.await.unwrap();
         b.await.unwrap();
