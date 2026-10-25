@@ -368,9 +368,16 @@ async fn on_message(
     };
     let reply_to = ev.event_id.clone();
     let me = client.user_id().map(ToOwned::to_owned);
+    let is_new = body.trim().eq_ignore_ascii_case("!new");
 
     // Runs take seconds; don't hold up the sync loop meanwhile.
     tokio::spawn(async move {
+        // A room with `threads` answers a main-timeline message in a new
+        // thread rooted at that message (but `!new` stays where it is).
+        let thread = match thread {
+            None if !is_new && agent.starts_threads(room.room_id()).await => Some(reply_to.clone()),
+            t => t,
+        };
         let send = |text: String| {
             let mut content = RoomMessageEventContent::text_markdown(text);
             if let Some(root) = &thread {
@@ -399,7 +406,7 @@ async fn on_message(
             eprintln!("could not write transcript: {e}");
         }
 
-        if body.trim().eq_ignore_ascii_case("!new") {
+        if is_new {
             let text = match agent.reset(room.room_id(), thread_id.as_deref()).await {
                 Ok(true) => "_New session: the next message starts fresh._".to_owned(),
                 Ok(false) => {

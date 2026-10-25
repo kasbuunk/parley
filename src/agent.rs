@@ -9,6 +9,7 @@
 //!   the profile says `resume`; `threads/<root event id>.session` for each
 //!   Matrix thread. A thread is its own conversation, so unrelated topics
 //!   don't share one context. `!new` clears the session it is sent in.
+//!   With `threads`, every main-timeline message starts a new thread.
 //!
 //! - `transcript.jsonl`: every text message in the room and every reply,
 //!   one JSON object per line (`ts`, `sender`, `thread`, `body`). Not sent
@@ -66,6 +67,9 @@ pub struct Profile {
     pub members: Option<Vec<OwnedUserId>>,
     /// Keep one session per room, so the agent remembers the conversation.
     pub resume: bool,
+    /// Answer a main-timeline message in a new thread started from it, so
+    /// every topic gets its own thread and session.
+    pub threads: bool,
     /// Whether SYSTEM.md replaces the harness's own system prompt or is
     /// appended to it.
     pub prompt: PromptMode,
@@ -83,6 +87,7 @@ impl Default for Profile {
             permission_mode: None,
             members: None,
             resume: false,
+            threads: false,
             prompt: PromptMode::Replace,
             model: None,
             timeout_secs: 300,
@@ -295,6 +300,9 @@ impl<H: Harness> Agent<H> {
             .open(dir.join("transcript.jsonl"))
             .await?;
         f.write_all(line.as_bytes()).await?;
+        // tokio writes in the background; without this the line may not be
+        // on disk yet when the next one is appended or someone reads it.
+        f.flush().await?;
         Ok(())
     }
 
@@ -305,6 +313,23 @@ impl<H: Harness> Agent<H> {
             return false;
         };
         std::fs::remove_file(base.join("restart")).is_ok()
+    }
+
+    /// Whether the room's profile says to answer main-timeline messages in
+    /// a new thread. A missing or broken profile says no.
+    pub async fn starts_threads(&self, room_id: &RoomId) -> bool {
+        match self.room_dir(room_id) {
+            Ok(dir) => Self::profile(&dir).await.is_ok_and(|p| p.threads),
+            Err(_) => false,
+        }
+    }
+
+    async fn profile(dir: &Path) -> Result<Profile> {
+        match tokio::fs::read_to_string(dir.join("room.toml")).await {
+            Ok(text) => toml::from_str(&text).context("room.toml is invalid"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Profile::default()),
+            Err(e) => Err(e).context("could not read room.toml"),
+        }
     }
 
     fn room_dir(&self, room_id: &RoomId) -> Result<PathBuf> {
@@ -340,11 +365,7 @@ impl<H: Harness> Agent<H> {
         let dir = self.room_dir(room_id)?;
         tokio::fs::create_dir_all(&dir).await?;
 
-        let profile = match tokio::fs::read_to_string(dir.join("room.toml")).await {
-            Ok(text) => toml::from_str(&text).context("room.toml is invalid")?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Profile::default(),
-            Err(e) => return Err(e).context("could not read room.toml"),
-        };
+        let profile = Self::profile(&dir).await?;
 
         // Fail closed: a capable room stops working as soon as someone
         // who is not on its list is in it.
@@ -440,7 +461,11 @@ mod tests {
             .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        sh.stdin.take().unwrap().write_all(format!("#!/bin/sh\n{body}\n").as_bytes()).unwrap();
+        sh.stdin
+            .take()
+            .unwrap()
+            .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+            .unwrap();
         assert!(sh.wait().unwrap().success());
         path.to_str().unwrap().to_owned()
     }
@@ -865,6 +890,28 @@ echo '{{"result":"ok"}}'"#,
         let dir = rooms.join(id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("room.toml"), "resume = true\n").unwrap();
+    }
+
+    #[tokio::test]
+    async fn starts_threads_only_when_the_profile_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = Agent::new(Fake::default(), tmp.path().to_owned());
+        for (id, toml) in [
+            ("!on:example.org", Some("threads = true\n")),
+            ("!off:example.org", Some("resume = true\n")),
+            ("!broken:example.org", Some("threads = \"yes\"\n")),
+            ("!none:example.org", None),
+        ] {
+            if let Some(toml) = toml {
+                let dir = tmp.path().join(id);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("room.toml"), toml).unwrap();
+            }
+        }
+        assert!(agent.starts_threads(&room("!on:example.org")).await);
+        assert!(!agent.starts_threads(&room("!off:example.org")).await);
+        assert!(!agent.starts_threads(&room("!broken:example.org")).await);
+        assert!(!agent.starts_threads(&room("!none:example.org")).await);
     }
 
     #[tokio::test]

@@ -15,7 +15,8 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
   message handler. A text message is recorded in the room transcript, then
   answered by an agent run in a spawned task (typing notice while it runs).
   A message in a Matrix thread is answered in that thread. `!new` clears the
-  session of the main timeline or thread it is sent in.
+  session of the main timeline or thread it is sent in. With `threads = true`
+  in room.toml, a main-timeline message is answered in a new thread on it.
 - `src/agent.rs`: one agent turn. Reads the room's folder, builds a `Run`,
   calls the `Harness`. `ClaudeCode` is the only harness: headless
   `claude -p … --output-format json`. Per-room lock keeps replies in order;
