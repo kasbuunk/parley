@@ -145,8 +145,22 @@ async fn main() -> Result<()> {
     });
 
     println!("listening");
-    client.sync(SyncSettings::default().token(response.next_batch)).await?;
-    Ok(())
+    // A dropped connection (lab restart, VPN switch, Wi-Fi change) ends a
+    // sync with an error. Keep going: the client remembers where it was, so
+    // nothing is missed or echoed twice. Back off up to a minute.
+    let mut settings = SyncSettings::default().token(response.next_batch);
+    let mut delay = std::time::Duration::from_secs(1);
+    loop {
+        match client.sync(settings.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!("sync failed: {e}; retrying in {}s", delay.as_secs());
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(60));
+                settings = SyncSettings::default();
+            }
+        }
+    }
 }
 
 /// Log in with the password once, save the session, and set up cross-signing
