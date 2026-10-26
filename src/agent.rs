@@ -15,7 +15,8 @@
 //!
 //! - `context`: the context mode `!context` set, overriding room.toml;
 //!   `MEMORY.md`: the room's notes in `digest` mode (see `memory.rs`);
-//!   `summaries/`: day and week summaries in `layered` mode (`layered.rs`).
+//!   `summaries/`: day and week summaries in `layered` mode (`layered.rs`),
+//!   unless room.toml puts them elsewhere (`summaries`, e.g. in the vault).
 //! - `transcript.jsonl`: every text message in the room and every reply,
 //!   one JSON object per line (`ts`, `sender`, `thread`, `body`). Not sent
 //!   to the model as a whole; `window` and `digest` modes quote its end, and
@@ -89,6 +90,12 @@ pub struct Profile {
     pub prompt: PromptMode,
     pub model: Option<String>,
     pub timeout_secs: u64,
+    /// A readable name for the room, used in the names of its summary
+    /// notes (`parley 2026-10-25.md`) and their tags.
+    pub name: Option<String>,
+    /// Folder for the `layered` mode's summary notes. Default: the room's
+    /// `summaries/`. Kas's vault: `…/life/ai/rooms/<name>`.
+    pub summaries: Option<PathBuf>,
 }
 
 impl Default for Profile {
@@ -106,6 +113,8 @@ impl Default for Profile {
             prompt: PromptMode::Replace,
             model: None,
             timeout_secs: 300,
+            name: None,
+            summaries: None,
         }
     }
 }
@@ -406,7 +415,7 @@ impl<H: Harness> Agent<H> {
                         " After every reply a short extra run updates the room's notes; `!context` shows them."
                     }
                     Mode::Layered(_) => {
-                        " Earlier days get summarised after replies, a few at a time; they are kept in the room's `summaries/` folder."
+                        " Earlier days get summarised after replies, a few at a time; they are kept as notes in the room's `summaries/` folder, or where room.toml's `summaries` says."
                     }
                     _ => " Saved sessions are kept for when you switch back to `session`.",
                 };
@@ -453,7 +462,8 @@ impl<H: Harness> Agent<H> {
             .unwrap_or_default();
         let msgs = layered::parse(&transcript, "");
         let today = layered::day_of(now());
-        let out_dir = dir.join("summaries");
+        let (out_dir, prefix) = summaries_of(&dir, &profile);
+        let name = profile.name.as_deref().unwrap_or(room_id.as_str());
         tokio::fs::create_dir_all(&out_dir).await?;
         // Locked down and small: it only writes text.
         let small = Profile {
@@ -462,7 +472,7 @@ impl<H: Harness> Agent<H> {
             ..Profile::default()
         };
         loop {
-            let have = read_summaries(&out_dir).await;
+            let have = read_summaries(&out_dir, &prefix).await;
             let jobs = layered::jobs(&msgs, today, &have);
             if jobs.is_empty() {
                 return Ok(());
@@ -482,8 +492,9 @@ impl<H: Harness> Agent<H> {
                 if out.text.trim().is_empty() {
                     bail!("the summary run for {} returned nothing", job.key);
                 }
-                let file = out_dir.join(format!("{}.md", job.key));
-                tokio::fs::write(&file, out.text.trim().to_owned() + "\n").await?;
+                let file = out_dir.join(format!("{prefix}{}.md", job.key));
+                let note = layered::note(&job, name, room_id.as_str(), &prefix, today, &out.text);
+                tokio::fs::write(&file, note).await?;
                 println!("[{room_id}] wrote {}", file.display());
             }
         }
@@ -675,7 +686,8 @@ impl<H: Harness> Agent<H> {
                 let path = dir.join("transcript.jsonl");
                 let transcript = tokio::fs::read_to_string(&path).await.unwrap_or_default();
                 let msgs = layered::parse(&transcript, body);
-                let have = read_summaries(&dir.join("summaries")).await;
+                let (sum_dir, prefix) = summaries_of(&dir, &profile);
+                let have = read_summaries(&sum_dir, &prefix).await;
                 layered::input(
                     &msgs,
                     thread,
@@ -745,8 +757,23 @@ fn now() -> u64 {
         .unwrap_or_default()
 }
 
-/// The summaries in `dir`, by file name without `.md`.
-async fn read_summaries(dir: &Path) -> HashMap<String, String> {
+/// Where a room's summary notes go, and the prefix of their file names.
+fn summaries_of(dir: &Path, profile: &Profile) -> (PathBuf, String) {
+    let folder = profile
+        .summaries
+        .clone()
+        .unwrap_or_else(|| dir.join("summaries"));
+    let prefix = profile
+        .name
+        .as_ref()
+        .map(|n| format!("{n} "))
+        .unwrap_or_default();
+    (folder, prefix)
+}
+
+/// The summaries in `dir` named `<prefix><key>.md`, by key, without their
+/// frontmatter.
+async fn read_summaries(dir: &Path, prefix: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return out;
@@ -757,11 +784,12 @@ async fn read_summaries(dir: &Path) -> HashMap<String, String> {
             .file_name()
             .and_then(|n| n.to_str())
             .and_then(|n| n.strip_suffix(".md"))
+            .and_then(|n| n.strip_prefix(prefix))
         else {
             continue;
         };
         if let Ok(text) = tokio::fs::read_to_string(&path).await {
-            out.insert(key.to_owned(), text);
+            out.insert(key.to_owned(), layered::strip_frontmatter(&text).to_owned());
         }
     }
     out
@@ -1524,7 +1552,15 @@ echo '{{"result":"ok"}}'"#,
     async fn layered_mode_summarises_past_days_and_quotes_the_thread() {
         let tmp = tempfile::tempdir().unwrap();
         let id = "!a:example.org";
-        room_toml(tmp.path(), id, "context = \"layered 5\"\n");
+        let vault = tmp.path().join("vault");
+        room_toml(
+            tmp.path(),
+            id,
+            &format!(
+                "context = \"layered 5\"\nname = \"garden\"\nsummaries = {:?}\n",
+                vault.display().to_string()
+            ),
+        );
         let dir = tmp.path().join(id);
         // Two messages from three days ago; the transcript is chronological.
         let old = now() - 3 * 86_400;
@@ -1570,6 +1606,10 @@ echo '{{"result":"ok"}}'"#,
         assert_eq!(calls[1].system_prompt, layered::DAY_PROMPT);
         assert!(calls[1].input.contains("[kas] plan the garden"));
         assert_eq!(calls.len(), 2);
+        let day = layered::date(layered::day_of(old));
+        let note = std::fs::read_to_string(vault.join(format!("garden {day}.md"))).unwrap();
+        assert!(note.starts_with("---\ntype: room-summary\n"), "{note}");
+        assert!(note.ends_with("---\n\n- garden planned\n"), "{note}");
 
         // The next message reads the summary and quotes the thread.
         agent

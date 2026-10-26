@@ -7,8 +7,10 @@
 //! 3. Summaries of earlier days: one per closed day of this and last week,
 //!    one per closed week before that (up to [`MAX_WEEKS`]). Days are UTC.
 //!    A closed day never changes, so its summary is written once by a
-//!    small run (after a reply, see [`jobs`]) and kept in the room's
-//!    `summaries/` folder; a week's summary is made from its days'.
+//!    small run (after a reply, see [`jobs`]) and kept as a note (see
+//!    [`note`]); a week's summary is made from its days'. The notes are
+//!    Obsidian-style Markdown, linked day to week in their frontmatter, so
+//!    they can live in Kas's vault.
 //! 4. Where the full transcript is, so the agent can look things up itself
 //!    when the past matters more than the summaries show.
 //!
@@ -87,8 +89,8 @@ fn monday(week: i64) -> i64 {
     week * 7 - 3
 }
 
-/// `2026-10-26` for a day number.
-pub fn date(day: i64) -> String {
+/// Year, month and day of a day number.
+fn civil(day: i64) -> (i64, i64, i64) {
     // Howard Hinnant's civil_from_days.
     let z = day + 719_468;
     let era = z.div_euclid(146_097);
@@ -98,7 +100,23 @@ pub fn date(day: i64) -> String {
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
+/// The day number of January 1st of `year`.
+fn new_year(year: i64) -> i64 {
+    // Howard Hinnant's days_from_civil, for March 1st of the year before,
+    // plus the 306 days from then to January 1st.
+    let y = year - 1;
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doe = yoe * 365 + yoe / 4 - yoe / 100;
+    era * 146_097 + doe - 719_468 + 306
+}
+
+/// `2026-10-26` for a day number.
+pub fn date(day: i64) -> String {
+    let (y, m, d) = civil(day);
     format!("{y:04}-{m:02}-{d:02}")
 }
 
@@ -106,14 +124,23 @@ fn weekday(day: i64) -> &'static str {
     ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][(day + 3).rem_euclid(7) as usize]
 }
 
-/// The file name (without `.md`) of a day's summary.
+/// The key of a day's summary: `2026-10-25`.
 pub fn day_key(day: i64) -> String {
-    format!("day-{}", date(day))
+    date(day)
 }
 
-/// The file name (without `.md`) of a week's summary, after its Monday.
+/// The key of a week's summary, its ISO week: `2026-W43`.
 pub fn week_key(week: i64) -> String {
-    format!("week-{}", date(monday(week)))
+    let thursday = monday(week) + 3;
+    let (year, _, _) = civil(thursday);
+    format!("{year}-W{:02}", (thursday - new_year(year)) / 7 + 1)
+}
+
+/// The time span a summary covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Span {
+    Day(i64),
+    Week(i64),
 }
 
 /// Which days get their own summary and which weeks one together, as of
@@ -137,6 +164,9 @@ fn spans(msgs: &[Msg], today: i64) -> (Vec<i64>, Vec<i64>) {
 #[derive(Debug)]
 pub struct Job {
     pub key: String,
+    pub span: Span,
+    /// The keys of the summaries this one is made from (a week's days).
+    pub parts: Vec<String>,
     pub system_prompt: &'static str,
     pub input: String,
 }
@@ -193,6 +223,8 @@ pub fn jobs(msgs: &[Msg], today: i64, have: &HashMap<String, String>) -> Vec<Job
         }
         out.push(Job {
             key,
+            span: Span::Day(*day),
+            parts: Vec::new(),
             system_prompt: DAY_PROMPT,
             input,
         });
@@ -220,6 +252,8 @@ pub fn jobs(msgs: &[Msg], today: i64, have: &HashMap<String, String>) -> Vec<Job
         };
         out.push(Job {
             key,
+            span: Span::Week(week),
+            parts: days.iter().map(|&d| day_key(d)).collect(),
             system_prompt: WEEK_PROMPT,
             input: format!(
                 "The days of the week of {}:\n\n{}",
@@ -229,6 +263,62 @@ pub fn jobs(msgs: &[Msg], today: i64, have: &HashMap<String, String>) -> Vec<Job
         });
     }
     out
+}
+
+/// A summary as a vault note: frontmatter, then the summary. Notes link by
+/// name (`[[parley 2026-W43]]`), so file names are `<prefix><key>.md`;
+/// the prefix (the room's name) keeps them apart from Kas's daily notes.
+/// Links go in the frontmatter only, as the vault's conventions ask.
+pub fn note(job: &Job, room: &str, room_id: &str, prefix: &str, today: i64, body: &str) -> String {
+    let link = |key: &str| format!("\"[[{prefix}{key}]]\"");
+    let mut fm = vec![
+        "type: room-summary".to_owned(),
+        "author: claude".to_owned(),
+        format!("room: {room}"),
+        format!("room-id: \"{room_id}\""),
+    ];
+    match job.span {
+        Span::Day(day) => {
+            fm.push("period: day".into());
+            fm.push(format!("date: {}", date(day)));
+            fm.push(format!("daily: \"[[{}]]\"", date(day)));
+            fm.push(format!("ai-notes: \"[[{}-ai]]\"", date(day)));
+            fm.push(format!("up: {}", link(&week_key(week_of(day)))));
+        }
+        Span::Week(week) => {
+            fm.push("period: week".into());
+            fm.push(format!("date: {}", date(monday(week))));
+            fm.push(format!(
+                "down: [{}]",
+                job.parts
+                    .iter()
+                    .map(|k| link(k))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    fm.push(format!("created: {}", date(today)));
+    let tag: String = room
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    fm.push(format!("tags: [room-summary, {tag}]"));
+    format!("---\n{}\n---\n\n{}\n", fm.join("\n"), body.trim())
+}
+
+/// A note's text without its frontmatter.
+pub fn strip_frontmatter(text: &str) -> &str {
+    text.strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n"))
+        .map_or(text, |(_, body)| body)
+        .trim()
 }
 
 fn clock(ts: u64) -> String {
@@ -341,7 +431,14 @@ mod tests {
         assert_eq!(date(11_016), "2000-02-29");
         assert_eq!(monday(week_of(MON + 6)), MON);
         assert_eq!(monday(week_of(MON - 1)), MON - 7);
-        assert_eq!(week_key(week_of(MON + 3)), "week-2026-10-26");
+        assert_eq!(week_key(week_of(MON + 3)), "2026-W44");
+        assert_eq!(week_key(week_of(MON - 1)), "2026-W43");
+        // ISO weeks belong to the year of their Thursday.
+        assert_eq!(new_year(2026), 20_454);
+        assert_eq!(date(new_year(2000)), "2000-01-01");
+        assert_eq!(week_key(week_of(20_453)), "2026-W01"); // 2025-12-31
+        assert_eq!(week_key(week_of(20_454 - 365 + 3)), "2025-W01"); // 2025-01-04
+        assert_eq!(week_key(week_of(new_year(2021) + 2)), "2020-W53"); // 2021-01-03
         assert_eq!(clock(MON as u64 * 86_400 + 3_723), "01:02");
     }
 
@@ -381,12 +478,7 @@ mod tests {
         // No week yet: its days have no summaries.
         assert_eq!(
             keys(&first),
-            [
-                "day-2026-09-26",
-                "day-2026-09-27",
-                "day-2026-10-23",
-                "day-2026-10-27"
-            ]
+            ["2026-09-26", "2026-09-27", "2026-10-23", "2026-10-27"]
         );
         assert!(
             first[0].input.contains("00:00 [kas] long ago"),
@@ -397,14 +489,15 @@ mod tests {
             have.insert(j.key.clone(), format!("- sum of {}", j.key));
         }
         let second = jobs(&msgs, today, &have);
-        assert_eq!(keys(&second), ["week-2026-09-21"]);
+        assert_eq!(keys(&second), ["2026-W39"]);
+        assert_eq!(second[0].parts, ["2026-09-26", "2026-09-27"]);
         assert_eq!(second[0].system_prompt, WEEK_PROMPT);
         assert!(
             second[0]
                 .input
-                .contains("## 2026-09-27 (Sun)\n\n- sum of day-2026-09-27")
+                .contains("## 2026-09-27 (Sun)\n\n- sum of 2026-09-27")
         );
-        have.insert("week-2026-09-21".into(), "- the week".into());
+        have.insert("2026-W39".into(), "- the week".into());
         assert!(jobs(&msgs, today, &have).is_empty());
     }
 
@@ -420,8 +513,8 @@ mod tests {
             msg(at(today, 40), "agent", Some("$t"), "answer"),
         ];
         let have = HashMap::from([
-            ("week-2026-09-21".to_owned(), "- the week".to_owned()),
-            ("day-2026-10-27".to_owned(), "- yesterday's gist".to_owned()),
+            ("2026-W39".to_owned(), "- the week".to_owned()),
+            ("2026-10-27".to_owned(), "- yesterday's gist".to_owned()),
         ]);
         let i = input(&msgs, Some("$t"), 1, today, &have, "/r/t.jsonl", "[Kas] q");
         assert!(i.starts_with("<room-history>\n"), "{i}");
@@ -465,6 +558,35 @@ mod tests {
             i.contains("[kas] elsewhere 2\n\n[agent] answer\n</recent-messages>"),
             "{i}"
         );
+    }
+
+    #[test]
+    fn notes_link_days_and_weeks_in_their_frontmatter() {
+        let today = MON + 2;
+        let msgs = vec![
+            msg(at(MON - 30, 10), "@kas:x", None, "long ago"),
+            msg(at(MON - 29, 10), "@kas:x", None, "next day"),
+        ];
+        let days = jobs(&msgs, today, &HashMap::new());
+        let n = note(&days[0], "parley", "!r:x", "parley ", today, "- gist\n");
+        assert_eq!(
+            n,
+            "---\ntype: room-summary\nauthor: claude\nroom: parley\nroom-id: \"!r:x\"\n\
+             period: day\ndate: 2026-09-26\ndaily: \"[[2026-09-26]]\"\n\
+             ai-notes: \"[[2026-09-26-ai]]\"\nup: \"[[parley 2026-W39]]\"\n\
+             created: 2026-10-28\ntags: [room-summary, parley]\n---\n\n- gist\n"
+        );
+        assert_eq!(strip_frontmatter(&n), "- gist");
+        assert_eq!(strip_frontmatter("- plain\n"), "- plain");
+
+        let have: HashMap<_, _> = days.iter().map(|j| (j.key.clone(), "- d".into())).collect();
+        let week = &jobs(&msgs, today, &have)[0];
+        let n = note(week, "My Room", "!r:x", "My Room ", today, "- w");
+        assert!(
+            n.contains("period: week\ndate: 2026-09-21\ndown: [\"[[My Room 2026-09-26]]\", \"[[My Room 2026-09-27]]\"]\n"),
+            "{n}"
+        );
+        assert!(n.contains("tags: [room-summary, my-room]"), "{n}");
     }
 
     #[test]

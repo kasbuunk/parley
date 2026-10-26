@@ -26,7 +26,9 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
   transcript's last N messages), `digest N` (window plus `MEMORY.md`
   notes, rewritten by a small Haiku run after each reply), `layered N`
   (`src/layered.rs`: cached day/week summaries, last N messages outside the
-  thread, the whole thread, and a pointer to the transcript). Set with
+  thread, the whole thread, and a pointer to the transcript). Summaries are
+  vault notes (frontmatter, day ↔ week links); room.toml's `name` and
+  `summaries` put them in Kas's vault as `ai/rooms/<name>/<name> <period>.md`. Set with
   `context` in room.toml or `!context <mode>` in the room (saved in the
   room's `context` file); `!context` alone shows the mode.
 - `src/breaker.rs`: the circuit breaker (also used for the Matrix sync loop).
@@ -38,7 +40,8 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
 - `session.json`, `store/`: the bot's login and encryption keys. Never delete
   or move these: losing them makes `@agent` a new, unverified device, and
   every person has to verify it again.
-- `rooms/<room id>/`:
+- `rooms/` is a symlink to `/mnt/nas/data/parley/rooms`, so restic backs it
+  up with the rest of the NAS. `rooms/<room id>/`:
   - `room.toml`: the room's profile (fields in `Profile`, `src/agent.rs`).
     Without it a room is locked down: no tools, no settings, no memory.
   - `SYSTEM.md`: system prompt (replaces or is appended, per `prompt`).
