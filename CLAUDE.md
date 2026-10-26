@@ -24,7 +24,9 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
 - `src/memory.rs`: context modes, what a turn remembers of earlier ones:
   `session` (resume one Claude session), `fresh`, `window N` (quote the
   transcript's last N messages), `digest N` (window plus `MEMORY.md`
-  notes, rewritten by a small Haiku run after each reply). Set with
+  notes, rewritten by a small Haiku run after each reply), `layered N`
+  (`src/layered.rs`: cached day/week summaries, last N messages outside the
+  thread, the whole thread, and a pointer to the transcript). Set with
   `context` in room.toml or `!context <mode>` in the room (saved in the
   room's `context` file); `!context` alone shows the mode.
 - `src/breaker.rs`: the circuit breaker (also used for the Matrix sync loop).

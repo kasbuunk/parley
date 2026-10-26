@@ -8,6 +8,9 @@
 //! - `digest N`: like `window N`, plus the room's `MEMORY.md`, which a small
 //!   extra run rewrites after every reply: what to keep, what is settled,
 //!   what is open.
+//! - `layered N`: a fresh run each turn, with summaries of earlier days and
+//!   weeks, the room's last N messages outside the thread, the thread so
+//!   far, and where to look up the rest (see `layered.rs`).
 //!
 //! A room's mode is, in order: the `context` file in its folder (written by
 //! `!context`), `context` in room.toml, or `session` if the profile says
@@ -23,7 +26,7 @@ pub const DEFAULT_WINDOW: usize = 20;
 /// Messages a digest room gets besides its memory, when the mode does not say.
 pub const DEFAULT_DIGEST_WINDOW: usize = 6;
 /// Longest a single transcript message is quoted, in characters.
-const MAX_MESSAGE_CHARS: usize = 2000;
+pub const MAX_MESSAGE_CHARS: usize = 2000;
 /// Longest the quoted history gets in total, in characters.
 const MAX_HISTORY_CHARS: usize = 40_000;
 
@@ -34,6 +37,7 @@ pub enum Mode {
     Fresh,
     Window(usize),
     Digest(usize),
+    Layered(usize),
 }
 
 impl Mode {
@@ -47,6 +51,7 @@ impl Mode {
 - `fresh`: no memory, every message stands alone
 - `window N`: the room's last N messages (default 20) come with each message
 - `digest N`: the room's memory notes, kept up to date after every reply, plus the last N messages (default 6)
+- `layered N`: summaries of earlier days and weeks, the last N messages outside the thread (default 10), the whole thread, and a pointer to the full transcript
 - `default`: back to what room.toml says";
 }
 
@@ -74,6 +79,7 @@ impl FromStr for Mode {
             ("fresh", None) => Mode::Fresh,
             ("window", n) => Mode::Window(n.unwrap_or(DEFAULT_WINDOW)),
             ("digest", n) => Mode::Digest(n.unwrap_or(DEFAULT_DIGEST_WINDOW)),
+            ("layered", n) => Mode::Layered(n.unwrap_or(crate::layered::DEFAULT_RECENT)),
             ("session" | "fresh", Some(_)) => bail!("`{name}` takes no number"),
             _ => bail!("unknown context mode {s:?}"),
         })
@@ -94,6 +100,7 @@ impl fmt::Display for Mode {
             Mode::Fresh => write!(f, "fresh"),
             Mode::Window(n) => write!(f, "window {n}"),
             Mode::Digest(n) => write!(f, "digest {n}"),
+            Mode::Layered(n) => write!(f, "layered {n}"),
         }
     }
 }
@@ -123,27 +130,29 @@ pub fn window(transcript: &str, n: usize, current: &str) -> String {
     let start = lines.len().saturating_sub(n);
     let mut out: Vec<String> = lines[start..]
         .iter()
-        .map(|l| {
-            // "@kas:example.org" reads better as "kas".
-            let who = l
-                .sender
-                .strip_prefix('@')
-                .and_then(|s| s.split(':').next())
-                .unwrap_or(&l.sender);
-            let body = if l.body.chars().count() > MAX_MESSAGE_CHARS {
-                let cut: String = l.body.chars().take(MAX_MESSAGE_CHARS).collect();
-                format!("{cut} […]")
-            } else {
-                l.body.clone()
-            };
-            format!("[{who}] {body}")
-        })
+        .map(|l| quote(&l.sender, &l.body, MAX_MESSAGE_CHARS))
         .collect();
     // Keep the newest messages when the whole is too long.
     while out.len() > 1 && out.iter().map(String::len).sum::<usize>() > MAX_HISTORY_CHARS {
         out.remove(0);
     }
     out.join("\n\n")
+}
+
+/// One transcript message as `[sender] body`, the body cut at `max`
+/// characters.
+pub fn quote(sender: &str, body: &str, max: usize) -> String {
+    // "@kas:example.org" reads better as "kas".
+    let who = sender
+        .strip_prefix('@')
+        .and_then(|s| s.split(':').next())
+        .unwrap_or(sender);
+    if body.chars().count() > max {
+        let cut: String = body.chars().take(max).collect();
+        format!("[{who}] {cut} […]")
+    } else {
+        format!("[{who}] {body}")
+    }
 }
 
 /// The input for a fresh run: room memory and recent messages, if any,
@@ -209,6 +218,8 @@ mod tests {
             ("window:5", Mode::Window(5), "window 5"),
             ("digest", Mode::Digest(DEFAULT_DIGEST_WINDOW), "digest 6"),
             ("digest 10", Mode::Digest(10), "digest 10"),
+            ("layered", Mode::Layered(10), "layered 10"),
+            ("layered 4", Mode::Layered(4), "layered 4"),
         ] {
             let parsed: Mode = text.parse().unwrap();
             assert_eq!(parsed, mode, "{text:?}");
@@ -226,6 +237,7 @@ mod tests {
         assert!(!Mode::Fresh.resumes());
         assert!(!Mode::Window(3).resumes());
         assert!(!Mode::Digest(3).resumes());
+        assert!(!Mode::Layered(3).resumes());
     }
 
     fn transcript(lines: &[(&str, &str)]) -> String {

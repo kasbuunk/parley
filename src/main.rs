@@ -30,6 +30,7 @@
 
 mod agent;
 mod breaker;
+mod layered;
 mod memory;
 
 use std::{
@@ -492,7 +493,7 @@ async fn on_message(
             eprintln!("could not write transcript: {e}");
         }
         send(answer).await;
-        // A `digest` room updates its notes now that the answer is out.
+        // A `digest` room updates its notes, a `layered` one its summaries, now that the answer is out.
         agent.reflect(room.room_id()).await;
 
         // An agent working on parley itself asks for a restart by creating

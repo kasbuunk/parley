@@ -14,7 +14,8 @@
 //!   With `threads`, every main-timeline message starts a new thread.
 //!
 //! - `context`: the context mode `!context` set, overriding room.toml;
-//!   `MEMORY.md`: the room's notes in `digest` mode (see `memory.rs`).
+//!   `MEMORY.md`: the room's notes in `digest` mode (see `memory.rs`);
+//!   `summaries/`: day and week summaries in `layered` mode (`layered.rs`).
 //! - `transcript.jsonl`: every text message in the room and every reply,
 //!   one JSON object per line (`ts`, `sender`, `thread`, `body`). Not sent
 //!   to the model as a whole; `window` and `digest` modes quote its end, and
@@ -39,6 +40,7 @@ use tokio::{process::Command, sync::Mutex};
 
 use crate::{
     breaker::{Breaker, State},
+    layered,
     memory::{self, Mode},
 };
 
@@ -258,6 +260,9 @@ pub struct Agent<H> {
     /// Per room, the last exchange a `digest` room still has to take into
     /// its memory (see [`Agent::reflect`]).
     pending_digests: std::sync::Mutex<HashMap<OwnedRoomId, Exchange>>,
+    /// Rooms whose summaries are being written, so two replies in a row
+    /// do not write the same ones twice.
+    summarising: std::sync::Mutex<std::collections::HashSet<OwnedRoomId>>,
 }
 
 /// One message and its answer.
@@ -283,6 +288,7 @@ impl<H: Harness> Agent<H> {
             breaker: std::sync::Mutex::new(Breaker::new(3, Duration::from_secs(300))),
             room_locks: Default::default(),
             pending_digests: Default::default(),
+            summarising: Default::default(),
         }
     }
 
@@ -399,6 +405,9 @@ impl<H: Harness> Agent<H> {
                     Mode::Digest(_) => {
                         " After every reply a short extra run updates the room's notes; `!context` shows them."
                     }
+                    Mode::Layered(_) => {
+                        " Earlier days get summarised after replies, a few at a time; they are kept in the room's `summaries/` folder."
+                    }
                     _ => " Saved sessions are kept for when you switch back to `session`.",
                 };
                 Ok(format!(
@@ -408,17 +417,75 @@ impl<H: Harness> Agent<H> {
         }
     }
 
-    /// In `digest` mode: fold the room's last exchange into its notes
-    /// (`MEMORY.md`). Call it after the reply is out, so the extra run does
-    /// not delay the answer. Does nothing when there is nothing pending.
+    /// Call after a reply is out, so the extra runs do not delay it. In
+    /// `digest` mode: fold the room's last exchange into its notes
+    /// (`MEMORY.md`). In `layered` mode: write the day and week summaries
+    /// that are missing.
     pub async fn reflect(&self, room_id: &RoomId) {
-        let Some(ex) = self.pending_digests.lock().unwrap().remove(room_id) else {
+        let pending = self.pending_digests.lock().unwrap().remove(room_id);
+        if let Some(ex) = pending {
+            let lock = self.room_lock(room_id);
+            let _turn = lock.lock().await;
+            if let Err(e) = self.digest(room_id, &ex).await {
+                eprintln!("[{room_id}] could not update the room's notes: {e:#}");
+            }
+        }
+        if !self.summarising.lock().unwrap().insert(room_id.to_owned()) {
             return;
+        }
+        if let Err(e) = self.summarise(room_id).await {
+            eprintln!("[{room_id}] could not write summaries: {e:#}");
+        }
+        self.summarising.lock().unwrap().remove(room_id);
+    }
+
+    /// In `layered` mode: write the room's missing summaries, days first,
+    /// then the weeks those complete. Without the room lock: it only adds
+    /// files that replies read when they are there.
+    async fn summarise(&self, room_id: &RoomId) -> Result<()> {
+        let dir = self.room_dir(room_id)?;
+        let profile = Self::profile(&dir).await?;
+        let (Mode::Layered(_), _) = Self::mode(&dir, &profile).await? else {
+            return Ok(());
         };
-        let lock = self.room_lock(room_id);
-        let _turn = lock.lock().await;
-        if let Err(e) = self.digest(room_id, &ex).await {
-            eprintln!("[{room_id}] could not update the room's notes: {e:#}");
+        let transcript = tokio::fs::read_to_string(dir.join("transcript.jsonl"))
+            .await
+            .unwrap_or_default();
+        let msgs = layered::parse(&transcript, "");
+        let today = layered::day_of(now());
+        let out_dir = dir.join("summaries");
+        tokio::fs::create_dir_all(&out_dir).await?;
+        // Locked down and small: it only writes text.
+        let small = Profile {
+            model: Some("haiku".into()),
+            timeout_secs: 120,
+            ..Profile::default()
+        };
+        loop {
+            let have = read_summaries(&out_dir).await;
+            let jobs = layered::jobs(&msgs, today, &have);
+            if jobs.is_empty() {
+                return Ok(());
+            }
+            for job in jobs {
+                let out = self
+                    .harness
+                    .run(&Run {
+                        profile: &small,
+                        system_prompt: job.system_prompt,
+                        workdir: &dir,
+                        input: &job.input,
+                        session: None,
+                        persist: false,
+                    })
+                    .await?;
+                if out.text.trim().is_empty() {
+                    bail!("the summary run for {} returned nothing", job.key);
+                }
+                let file = out_dir.join(format!("{}.md", job.key));
+                tokio::fs::write(&file, out.text.trim().to_owned() + "\n").await?;
+                println!("[{room_id}] wrote {}", file.display());
+            }
         }
     }
 
@@ -604,6 +671,21 @@ impl<H: Harness> Agent<H> {
                 };
                 memory::with_history(notes.as_deref(), &history, &message)
             }
+            Mode::Layered(n) => {
+                let path = dir.join("transcript.jsonl");
+                let transcript = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+                let msgs = layered::parse(&transcript, body);
+                let have = read_summaries(&dir.join("summaries")).await;
+                layered::input(
+                    &msgs,
+                    thread,
+                    n,
+                    layered::day_of(now()),
+                    &have,
+                    &path.display().to_string(),
+                    &message,
+                )
+            }
         };
         let workdir = profile.workdir.clone().unwrap_or_else(|| dir.clone());
         let run = Run {
@@ -654,6 +736,35 @@ impl<H: Harness> Agent<H> {
             }
         }
     }
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+/// The summaries in `dir`, by file name without `.md`.
+async fn read_summaries(dir: &Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return out;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let Some(key) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".md"))
+        else {
+            continue;
+        };
+        if let Ok(text) = tokio::fs::read_to_string(&path).await {
+            out.insert(key.to_owned(), text);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1406,6 +1517,71 @@ echo '{{"result":"ok"}}'"#,
                 .await
                 .unwrap()
                 .contains("- Kas said hi twice")
+        );
+    }
+
+    #[tokio::test]
+    async fn layered_mode_summarises_past_days_and_quotes_the_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "!a:example.org";
+        room_toml(tmp.path(), id, "context = \"layered 5\"\n");
+        let dir = tmp.path().join(id);
+        // Two messages from three days ago; the transcript is chronological.
+        let old = now() - 3 * 86_400;
+        let lines: String = [("@kas:x", "plan the garden"), ("agent", "dig first")]
+            .iter()
+            .map(|(s, b)| {
+                serde_json::json!({"ts": old, "sender": s, "thread": null, "body": b}).to_string()
+                    + "\n"
+            })
+            .collect();
+        std::fs::write(dir.join("transcript.jsonl"), lines).unwrap();
+
+        let fake = Fake::default();
+        {
+            let mut results = fake.results.lock().unwrap();
+            results.push_back(Ok("thread answer".into())); // reply
+            results.push_back(Ok("- garden planned".into())); // day summary
+        }
+        let agent = Agent::new(fake, tmp.path().to_owned());
+        let r = room(id);
+        agent
+            .record(&r, Some("$t"), "@kas:x", "and now?")
+            .await
+            .unwrap();
+        let answer = agent.reply(&r, Some("$t"), "Kas", "and now?", &[]).await;
+        assert_eq!(answer, "thread answer");
+        agent
+            .record(&r, Some("$t"), "agent", &answer)
+            .await
+            .unwrap();
+        agent.reflect(&r).await;
+
+        let calls = agent.harness.calls();
+        assert!(!calls[0].persist);
+        let input = &calls[0].input;
+        assert!(input.contains("(not summarised yet)"), "{input}");
+        assert!(input.contains("transcript.jsonl"), "{input}");
+        assert!(
+            input.contains("[kas] plan the garden\n\n[agent] dig first"),
+            "{input}"
+        );
+        assert!(input.ends_with("[Kas] and now?"), "{input}");
+        assert_eq!(calls[1].system_prompt, layered::DAY_PROMPT);
+        assert!(calls[1].input.contains("[kas] plan the garden"));
+        assert_eq!(calls.len(), 2);
+
+        // The next message reads the summary and quotes the thread.
+        agent
+            .record(&r, Some("$t"), "@kas:x", "more")
+            .await
+            .unwrap();
+        agent.reply(&r, Some("$t"), "Kas", "more", &[]).await;
+        let input = &agent.harness.calls()[2].input;
+        assert!(input.contains("- garden planned"), "{input}");
+        assert!(
+            input.contains("so far:\n\n[kas] and now?\n\n[agent] thread answer\n</this-thread>"),
+            "{input}"
         );
     }
 
