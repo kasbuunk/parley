@@ -13,9 +13,12 @@
 //!   session it is sent in and says how many messages it had.
 //!   With `threads`, every main-timeline message starts a new thread.
 //!
+//! - `context`: the context mode `!context` set, overriding room.toml;
+//!   `MEMORY.md`: the room's notes in `digest` mode (see `memory.rs`).
 //! - `transcript.jsonl`: every text message in the room and every reply,
 //!   one JSON object per line (`ts`, `sender`, `thread`, `body`). Not sent
-//!   to the model; an agent with file tools can read or grep it to look back.
+//!   to the model as a whole; `window` and `digest` modes quote its end, and
+//!   an agent with file tools can read or grep it to look back.
 //!
 //! Each message (prefixed with the sender's name) is one user turn. The
 //! model and harness sit behind [`Harness`]; Claude Code is the first
@@ -34,7 +37,10 @@ use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId, RoomId};
 use serde::Deserialize;
 use tokio::{process::Command, sync::Mutex};
 
-use crate::breaker::{Breaker, State};
+use crate::{
+    breaker::{Breaker, State},
+    memory::{self, Mode},
+};
 
 const DEFAULT_SYSTEM_PROMPT: &str = "\
 You are the agent in a private Matrix chat on Kas's home lab. People write to \
@@ -68,7 +74,11 @@ pub struct Profile {
     /// If set, the agent only runs while every member of the room is listed.
     pub members: Option<Vec<OwnedUserId>>,
     /// Keep one session per room, so the agent remembers the conversation.
+    /// Shorthand for `context = "session"`.
     pub resume: bool,
+    /// What a turn remembers of earlier ones (see `memory.rs`). Default:
+    /// `session` with `resume`, else `fresh`. `!context` overrides it.
+    pub context: Option<Mode>,
     /// Answer a main-timeline message in a new thread started from it, so
     /// every topic gets its own thread and session.
     pub threads: bool,
@@ -89,6 +99,7 @@ impl Default for Profile {
             permission_mode: None,
             members: None,
             resume: false,
+            context: None,
             threads: false,
             prompt: PromptMode::Replace,
             model: None,
@@ -112,6 +123,8 @@ pub struct Run<'a> {
     pub input: &'a str,
     /// Session to continue, if any.
     pub session: Option<&'a str>,
+    /// Whether the harness should keep the session for a later turn.
+    pub persist: bool,
 }
 
 pub struct Output {
@@ -178,7 +191,7 @@ impl ClaudeCode {
         if p.settings.is_empty() {
             args.push("--disable-slash-commands".into());
         }
-        if !p.resume {
+        if !run.persist {
             args.push("--no-session-persistence".into());
         }
         if let Some(mode) = &p.permission_mode {
@@ -242,6 +255,24 @@ pub struct Agent<H> {
     breaker: std::sync::Mutex<Breaker>,
     /// One lock per room, so replies come out in the order messages came in.
     room_locks: std::sync::Mutex<HashMap<OwnedRoomId, Arc<Mutex<()>>>>,
+    /// Per room, the last exchange a `digest` room still has to take into
+    /// its memory (see [`Agent::reflect`]).
+    pending_digests: std::sync::Mutex<HashMap<OwnedRoomId, Exchange>>,
+}
+
+/// One message and its answer.
+struct Exchange {
+    sender: String,
+    body: String,
+    answer: String,
+}
+
+/// Where a room's context mode comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Command,
+    Profile,
+    Default,
 }
 
 impl<H: Harness> Agent<H> {
@@ -251,6 +282,7 @@ impl<H: Harness> Agent<H> {
             rooms_dir,
             breaker: std::sync::Mutex::new(Breaker::new(3, Duration::from_secs(300))),
             room_locks: Default::default(),
+            pending_digests: Default::default(),
         }
     }
 
@@ -265,13 +297,7 @@ impl<H: Harness> Agent<H> {
         body: &str,
         members: &[OwnedUserId],
     ) -> String {
-        let lock = self
-            .room_locks
-            .lock()
-            .unwrap()
-            .entry(room_id.to_owned())
-            .or_default()
-            .clone();
+        let lock = self.room_lock(room_id);
         let _turn = lock.lock().await;
 
         if let State::Open(left) = self.breaker.lock().unwrap().state() {
@@ -295,6 +321,134 @@ impl<H: Harness> Agent<H> {
                 format!("_Agent error: {e}_")
             }
         }
+    }
+
+    fn room_lock(&self, room_id: &RoomId) -> Arc<Mutex<()>> {
+        self.room_locks
+            .lock()
+            .unwrap()
+            .entry(room_id.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    /// The room's context mode and where it was set.
+    async fn mode(dir: &Path, profile: &Profile) -> Result<(Mode, Source)> {
+        if let Some(mode) = memory::read_override(dir)
+            .await
+            .context("the `context` file is invalid")?
+        {
+            return Ok((mode, Source::Command));
+        }
+        Ok(match profile.context {
+            Some(mode) => (mode, Source::Profile),
+            None if profile.resume => (Mode::Session, Source::Default),
+            None => (Mode::Fresh, Source::Default),
+        })
+    }
+
+    /// `!context` (with `arg` `None`): the room's context mode, and its
+    /// notes in `digest` mode. `!context <mode>`: switch to it from the
+    /// next message on; `default` goes back to room.toml.
+    pub async fn context(&self, room_id: &RoomId, arg: Option<&str>) -> Result<String> {
+        let dir = self.room_dir(room_id)?;
+        let lock = self.room_lock(room_id);
+        let _turn = lock.lock().await;
+        let profile = Self::profile(&dir).await?;
+        let file = dir.join("context");
+        match arg.map(str::trim).filter(|a| !a.is_empty()) {
+            None => {
+                let (mode, source) = Self::mode(&dir, &profile).await?;
+                let from = match source {
+                    Source::Command => "set with `!context`",
+                    Source::Profile => "from room.toml",
+                    Source::Default => "the default",
+                };
+                let mut text = format!("Context: **{mode}** ({from}).");
+                if let Mode::Digest(_) = mode {
+                    match tokio::fs::read_to_string(dir.join("MEMORY.md")).await {
+                        Ok(notes) if !notes.trim().is_empty() => {
+                            text.push_str(&format!("\n\nThe room's notes:\n\n{}", notes.trim()))
+                        }
+                        _ => text.push_str("\n\nNo notes yet."),
+                    }
+                }
+                text.push_str(&format!(
+                    "\n\nSwitch with `!context <mode>`:\n{}",
+                    Mode::HELP
+                ));
+                Ok(text)
+            }
+            Some(a) if a.eq_ignore_ascii_case("default") => {
+                match tokio::fs::remove_file(&file).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+                let (mode, _) = Self::mode(&dir, &profile).await?;
+                Ok(format!(
+                    "Context back to the room's default: **{mode}**, from the next message."
+                ))
+            }
+            Some(a) => {
+                let mode: Mode = a.parse()?;
+                tokio::fs::create_dir_all(&dir).await?;
+                tokio::fs::write(&file, format!("{mode}\n")).await?;
+                let note = match mode {
+                    Mode::Session => " Sessions saved earlier carry on; `!new` starts one over.",
+                    Mode::Digest(_) => {
+                        " After every reply a short extra run updates the room's notes; `!context` shows them."
+                    }
+                    _ => " Saved sessions are kept for when you switch back to `session`.",
+                };
+                Ok(format!(
+                    "Context is now **{mode}**, from the next message.{note}"
+                ))
+            }
+        }
+    }
+
+    /// In `digest` mode: fold the room's last exchange into its notes
+    /// (`MEMORY.md`). Call it after the reply is out, so the extra run does
+    /// not delay the answer. Does nothing when there is nothing pending.
+    pub async fn reflect(&self, room_id: &RoomId) {
+        let Some(ex) = self.pending_digests.lock().unwrap().remove(room_id) else {
+            return;
+        };
+        let lock = self.room_lock(room_id);
+        let _turn = lock.lock().await;
+        if let Err(e) = self.digest(room_id, &ex).await {
+            eprintln!("[{room_id}] could not update the room's notes: {e:#}");
+        }
+    }
+
+    async fn digest(&self, room_id: &RoomId, ex: &Exchange) -> Result<()> {
+        let dir = self.room_dir(room_id)?;
+        let file = dir.join("MEMORY.md");
+        let notes = tokio::fs::read_to_string(&file).await.ok();
+        let input = memory::digest_input(notes.as_deref(), &ex.sender, &ex.body, &ex.answer);
+        // Locked down and small: it only rewrites text.
+        let profile = Profile {
+            model: Some("haiku".into()),
+            timeout_secs: 120,
+            ..Profile::default()
+        };
+        let out = self
+            .harness
+            .run(&Run {
+                profile: &profile,
+                system_prompt: memory::DIGEST_SYSTEM_PROMPT,
+                workdir: &dir,
+                input: &input,
+                session: None,
+                persist: false,
+            })
+            .await?;
+        if out.text.trim().is_empty() {
+            bail!("the digest run returned nothing");
+        }
+        tokio::fs::write(&file, out.text.trim().to_owned() + "\n").await?;
+        Ok(())
     }
 
     /// Forget the session of the room's main timeline, or of one thread.
@@ -427,15 +581,30 @@ impl<H: Harness> Agent<H> {
             Err(e) => return Err(e).context("could not read SYSTEM.md"),
         };
 
+        let (mode, _) = Self::mode(&dir, &profile).await?;
         let session_file = self.session_file(&dir, thread)?;
-        let saved = if profile.resume {
+        let saved = if mode.resumes() {
             Saved::read(&session_file).await
         } else {
             None
         };
         let session = saved.as_ref().map(|s| s.id.clone());
 
-        let input = format!("[{sender}] {body}");
+        let message = format!("[{sender}] {body}");
+        let input = match mode {
+            Mode::Session | Mode::Fresh => message,
+            Mode::Window(n) | Mode::Digest(n) => {
+                let transcript = tokio::fs::read_to_string(dir.join("transcript.jsonl"))
+                    .await
+                    .unwrap_or_default();
+                let history = memory::window(&transcript, n, body);
+                let notes = match mode {
+                    Mode::Digest(_) => tokio::fs::read_to_string(dir.join("MEMORY.md")).await.ok(),
+                    _ => None,
+                };
+                memory::with_history(notes.as_deref(), &history, &message)
+            }
+        };
         let workdir = profile.workdir.clone().unwrap_or_else(|| dir.clone());
         let run = Run {
             profile: &profile,
@@ -443,10 +612,21 @@ impl<H: Harness> Agent<H> {
             workdir: &workdir,
             input: &input,
             session: session.as_deref(),
+            persist: mode.resumes(),
         };
         match self.harness.run(&run).await {
             Ok(out) => {
-                if let (true, Some(id)) = (profile.resume, &out.session) {
+                if let Mode::Digest(_) = mode {
+                    self.pending_digests.lock().unwrap().insert(
+                        room_id.to_owned(),
+                        Exchange {
+                            sender: sender.to_owned(),
+                            body: body.to_owned(),
+                            answer: out.text.clone(),
+                        },
+                    );
+                }
+                if let (true, Some(id)) = (mode.resumes(), &out.session) {
                     if let Some(parent) = session_file.parent() {
                         tokio::fs::create_dir_all(parent).await?;
                     }
@@ -534,6 +714,7 @@ mod tests {
                 workdir,
                 input,
                 session: None,
+                persist: false,
             };
             match tokio::time::timeout(self.1, self.0.run(&run)).await {
                 Ok(r) => r.map(|o| o.text),
@@ -671,6 +852,7 @@ echo '{{"result":"ok"}}'"#,
         workdir: PathBuf,
         input: String,
         session: Option<String>,
+        persist: bool,
     }
 
     /// Records calls; answers from `results` (then "ok"). With `sleepy`, a
@@ -708,6 +890,7 @@ echo '{{"result":"ok"}}'"#,
                 workdir: run.workdir.to_owned(),
                 input: input.to_owned(),
                 session: run.session.map(ToOwned::to_owned),
+                persist: run.persist,
             });
             if self.sleepy {
                 let n = input.rsplit(' ').next().unwrap().to_owned();
@@ -1069,6 +1252,172 @@ echo '{{"result":"ok"}}'"#,
         assert!(lines[0]["thread"].is_null());
         assert_eq!(lines[1]["thread"], "$t");
         assert_eq!(lines[1]["body"], "hello\nthere");
+    }
+
+    // ---- context modes ----
+
+    fn room_toml(rooms: &Path, id: &str, toml: &str) {
+        let dir = rooms.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("room.toml"), toml).unwrap();
+    }
+
+    /// A message as main.rs handles it: recorded first, then answered.
+    async fn say(agent: &Agent<Fake>, r: &RoomId, body: &str) -> String {
+        agent.record(r, None, "@kas:x", body).await.unwrap();
+        let answer = agent.reply(r, None, "Kas", body, &[]).await;
+        agent.record(r, None, "agent", &answer).await.unwrap();
+        agent.reflect(r).await;
+        answer
+    }
+
+    #[tokio::test]
+    async fn mode_comes_from_command_then_profile_then_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = Agent::new(Fake::default(), tmp.path().to_owned());
+        let r = room("!a:example.org");
+        let status = agent.context(&r, None).await.unwrap();
+        assert!(
+            status.starts_with("Context: **fresh** (the default)."),
+            "{status}"
+        );
+
+        room_toml(tmp.path(), r.as_str(), "resume = true\n");
+        let status = agent.context(&r, None).await.unwrap();
+        assert!(
+            status.starts_with("Context: **session** (the default)."),
+            "{status}"
+        );
+
+        room_toml(
+            tmp.path(),
+            r.as_str(),
+            "resume = true\ncontext = \"window 4\"\n",
+        );
+        let status = agent.context(&r, None).await.unwrap();
+        assert!(
+            status.starts_with("Context: **window 4** (from room.toml)."),
+            "{status}"
+        );
+
+        let set = agent.context(&r, Some("digest 3")).await.unwrap();
+        assert!(set.starts_with("Context is now **digest 3**"), "{set}");
+        let status = agent.context(&r, None).await.unwrap();
+        assert!(
+            status.starts_with("Context: **digest 3** (set with `!context`)."),
+            "{status}"
+        );
+        assert!(status.contains("No notes yet."), "{status}");
+
+        let back = agent.context(&r, Some("default")).await.unwrap();
+        assert!(back.contains("**window 4**"), "{back}");
+        assert!(agent.context(&r, Some("bogus")).await.is_err());
+        assert!(
+            agent
+                .context(&r, None)
+                .await
+                .unwrap()
+                .contains("**window 4**")
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_away_from_session_runs_fresh_and_back_resumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        resume_room(tmp.path(), "!a:example.org");
+        let agent = Agent::new(Fake::default(), tmp.path().to_owned());
+        let r = room("!a:example.org");
+        say(&agent, &r, "one").await; // session sess-1
+        agent.context(&r, Some("fresh")).await.unwrap();
+        say(&agent, &r, "two").await;
+        agent.context(&r, Some("session")).await.unwrap();
+        say(&agent, &r, "three").await;
+
+        let calls = agent.harness.calls();
+        let got: Vec<_> = calls
+            .iter()
+            .map(|c| (c.session.clone(), c.persist))
+            .collect();
+        assert_eq!(
+            got,
+            [(None, true), (None, false), (Some("sess-1".into()), true)]
+        );
+        assert_eq!(calls[1].input, "[Kas] two");
+    }
+
+    #[tokio::test]
+    async fn window_mode_quotes_recent_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        room_toml(tmp.path(), "!a:example.org", "context = \"window 2\"\n");
+        let agent = Agent::new(Fake::default(), tmp.path().to_owned());
+        let r = room("!a:example.org");
+        say(&agent, &r, "first").await;
+        say(&agent, &r, "second").await;
+
+        let calls = agent.harness.calls();
+        assert_eq!(calls[0].input, "[Kas] first"); // nothing before it
+        let input = &calls[1].input;
+        assert!(input.contains("[kas] first\n\n[agent] ok"), "{input}");
+        assert!(
+            input.ends_with("</recent-messages>\n\n[Kas] second"),
+            "{input}"
+        );
+        assert!(calls.iter().all(|c| c.session.is_none() && !c.persist));
+    }
+
+    #[tokio::test]
+    async fn digest_mode_keeps_notes_after_each_reply() {
+        let tmp = tempfile::tempdir().unwrap();
+        room_toml(tmp.path(), "!a:example.org", "context = \"digest 1\"\n");
+        let fake = Fake::default();
+        {
+            let mut results = fake.results.lock().unwrap();
+            results.push_back(Ok("hello".into())); // reply to "hi"
+            results.push_back(Ok("- Kas said hi".into())); // digest
+            results.push_back(Ok("fine".into())); // reply to "again"
+            results.push_back(Ok("- Kas said hi twice".into())); // digest
+        }
+        let agent = Agent::new(fake, tmp.path().to_owned());
+        let r = room("!a:example.org");
+        assert_eq!(say(&agent, &r, "hi").await, "hello");
+        let dir = tmp.path().join("!a:example.org");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("MEMORY.md")).unwrap(),
+            "- Kas said hi\n"
+        );
+        say(&agent, &r, "again").await;
+
+        let calls = agent.harness.calls();
+        assert_eq!(calls.len(), 4); // reply, digest, reply, digest
+        assert_eq!(calls[1].system_prompt, memory::DIGEST_SYSTEM_PROMPT);
+        assert!(
+            calls[1].input.contains("[Kas] hi\n\n[agent] hello"),
+            "{}",
+            calls[1].input
+        );
+        let input = &calls[2].input;
+        assert!(input.contains("<room-memory>"), "{input}");
+        assert!(input.contains("- Kas said hi"), "{input}");
+        assert!(input.contains("[agent] hello"), "{input}");
+        assert!(!input.contains("[kas] hi"), "window is 1: {input}");
+        assert!(
+            agent
+                .context(&r, None)
+                .await
+                .unwrap()
+                .contains("- Kas said hi twice")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_reply_is_not_digested() {
+        let tmp = tempfile::tempdir().unwrap();
+        room_toml(tmp.path(), "!a:example.org", "context = \"digest\"\n");
+        let agent = Agent::new(Fake::failing(1), tmp.path().to_owned());
+        let r = room("!a:example.org");
+        assert!(say(&agent, &r, "hi").await.starts_with("_Agent error"));
+        assert_eq!(agent.harness.calls().len(), 1);
+        assert!(!tmp.path().join("!a:example.org/MEMORY.md").exists());
     }
 
     #[tokio::test]

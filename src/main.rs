@@ -30,6 +30,7 @@
 
 mod agent;
 mod breaker;
+mod memory;
 
 use std::{
     env,
@@ -369,13 +370,22 @@ async fn on_message(
     let reply_to = ev.event_id.clone();
     let me = client.user_id().map(ToOwned::to_owned);
     let is_new = body.trim().eq_ignore_ascii_case("!new");
+    // `!context` or `!context <mode>`: show or switch the room's context mode.
+    let context_arg = body
+        .trim()
+        .strip_prefix("!context")
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        .map(|rest| rest.trim().to_owned());
+    let is_command = is_new || context_arg.is_some();
 
     // Runs take seconds; don't hold up the sync loop meanwhile.
     tokio::spawn(async move {
         // A room with `threads` answers a main-timeline message in a new
-        // thread rooted at that message (but `!new` stays where it is).
+        // thread rooted at that message (but commands stay where they are).
         let thread = match thread {
-            None if !is_new && agent.starts_threads(room.room_id()).await => Some(reply_to.clone()),
+            None if !is_command && agent.starts_threads(room.room_id()).await => {
+                Some(reply_to.clone())
+            }
             t => t,
         };
         let send = |text: String| {
@@ -417,6 +427,16 @@ async fn on_message(
                     "_There was no session yet; the next message starts fresh._".to_owned()
                 }
                 Err(e) => format!("_Could not reset the session: {e}_"),
+            };
+            send(text).await;
+            return;
+        }
+
+        if let Some(arg) = context_arg {
+            let arg = Some(arg.as_str()).filter(|a| !a.is_empty());
+            let text = match agent.context(room.room_id(), arg).await {
+                Ok(text) => text,
+                Err(e) => format!("_{e}_\n\n{}", memory::Mode::HELP),
             };
             send(text).await;
             return;
@@ -472,6 +492,8 @@ async fn on_message(
             eprintln!("could not write transcript: {e}");
         }
         send(answer).await;
+        // A `digest` room updates its notes now that the answer is out.
+        agent.reflect(room.room_id()).await;
 
         // An agent working on parley itself asks for a restart by creating
         // `restart` in the data dir; exit only after its reply is out, and
