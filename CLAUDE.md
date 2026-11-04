@@ -31,6 +31,15 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
   `summaries` put them in Kas's vault as `ai/rooms/<name>/<name> <period>.md`. Set with
   `context` in room.toml or `!context <mode>` in the room (saved in the
   room's `context` file); `!context` alone shows the mode.
+- `src/post.rs`: posting as a tool. With `reply = "tool"` in room.toml the
+  run's final text is not posted; the agent gets an MCP tool `post(body,
+  thread?)` (served by `parley mcp`, which Claude Code starts per run and
+  which forwards to parley over `post.sock` in the data dir, with a
+  per-run token). It may post several times or not at all. A final answer
+  of `[silent]` (no posts) gets a ✓ reaction; any other final text with
+  no posts is posted as a fallback, so errors still show. Posts go only to
+  the run's own room (this thread by default, `thread: "main"` for the
+  main timeline).
 - `src/breaker.rs`: the circuit breaker (also used for the Matrix sync loop).
 
 ## State on the lab

@@ -32,6 +32,7 @@ mod agent;
 mod breaker;
 mod layered;
 mod memory;
+mod post;
 
 use std::{
     env,
@@ -55,10 +56,11 @@ use matrix_sdk::{
     },
     event_handler::Ctx,
     ruma::{
-        OwnedUserId,
+        OwnedEventId, OwnedUserId,
         api::{client::uiaa, error::ErrorKind},
         events::key::verification::request::ToDeviceKeyVerificationRequestEvent,
-        events::relation::Thread,
+        events::reaction::ReactionEventContent,
+        events::relation::{Annotation, Thread},
         events::room::{
             member::StrippedRoomMemberEvent,
             message::{
@@ -131,6 +133,11 @@ fn sync_backoff(failures: u32) -> Duration {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `parley mcp`: the `post` tool's MCP server, started by Claude Code for
+    // one turn. Its stdout is the protocol, so nothing else may print.
+    if env::args().nth(1).as_deref() == Some("mcp") {
+        return post::mcp_main();
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -174,6 +181,14 @@ async fn main() -> Result<()> {
         config.data_dir.join("rooms"),
     );
     client.add_event_handler_context(Arc::new(agent));
+    // The socket the `post` tool talks to (see post.rs).
+    let tooling = Tooling {
+        posts: Arc::new(post::Posts::default()),
+        socket: config.data_dir.join("post.sock"),
+        exe: env::current_exe().context("cannot find parley's own program")?,
+    };
+    post::listen(&tooling.socket, tooling.posts.clone())?;
+    client.add_event_handler_context(Arc::new(tooling));
     client.add_event_handler(on_message);
     let allowed = config.allowed.clone();
     client.add_event_handler(
@@ -335,12 +350,48 @@ async fn on_invite(
     }
 }
 
+/// What a `reply = "tool"` room's runs need to post.
+struct Tooling {
+    posts: Arc<post::Posts>,
+    socket: PathBuf,
+    /// This program, started as `parley mcp` for each run.
+    exe: PathBuf,
+}
+
+/// The content of a post to `target`, for a turn answering `reply_to` in
+/// the conversation `here` (a thread root, or the main timeline).
+fn post_content(
+    body: String,
+    target: &post::Target,
+    here: Option<&OwnedEventId>,
+    reply_to: &OwnedEventId,
+) -> Result<(RoomMessageEventContent, Option<String>)> {
+    let mut content = RoomMessageEventContent::text_markdown(body);
+    let (root, latest) = match target {
+        post::Target::Here => match here {
+            Some(root) => (Some(root.clone()), reply_to.clone()),
+            None => (None, reply_to.clone()),
+        },
+        post::Target::Main => (None, reply_to.clone()),
+        post::Target::Thread(t) => {
+            let root: OwnedEventId = t.as_str().try_into().context("bad thread ID")?;
+            (Some(root.clone()), root)
+        }
+    };
+    let thread = root.as_ref().map(|r| r.as_str().to_owned());
+    if let Some(root) = root {
+        content.relates_to = Some(Relation::Thread(Thread::plain(root, latest)));
+    }
+    Ok((content, thread))
+}
+
 /// Answer every text message from someone else with an agent run.
 async fn on_message(
     ev: OriginalSyncRoomMessageEvent,
     room: Room,
     client: Client,
     Ctx(agent): Ctx<Arc<Agent<ClaudeCode>>>,
+    Ctx(tooling): Ctx<Arc<Tooling>>,
 ) {
     if room.state() != RoomState::Joined || Some(ev.sender.as_ref()) == client.user_id() {
         return;
@@ -474,25 +525,86 @@ async fn on_message(
                 return;
             }
         };
+        // A `reply = "tool"` room posts with the `post` tool while it runs.
+        let ticket = if agent.replies_with_tool(room.room_id()).await {
+            let (room, agent, here, reply_to) = (
+                room.clone(),
+                agent.clone(),
+                thread.clone(),
+                reply_to.clone(),
+            );
+            let send: post::SendFn = Arc::new(move |p: post::Post| {
+                let (room, agent, here, reply_to) =
+                    (room.clone(), agent.clone(), here.clone(), reply_to.clone());
+                Box::pin(async move {
+                    let body = p.body.clone();
+                    let (content, thread) =
+                        post_content(p.body, &p.target, here.as_ref(), &reply_to)?;
+                    let sent = room.send(content).await?;
+                    if let Err(e) = agent
+                        .record(room.room_id(), thread.as_deref(), "agent", &body)
+                        .await
+                    {
+                        eprintln!("could not write transcript: {e}");
+                    }
+                    Ok(sent.response.event_id.to_string())
+                })
+            });
+            match tooling.posts.register(send) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    eprintln!("could not set up the post tool, answering as text: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let mcp_config = ticket
+            .as_ref()
+            .map(|t| post::mcp_config(&tooling.exe, &tooling.socket, &t.token));
         let answer = agent
-            .reply(
+            .reply_with(
                 room.room_id(),
                 thread_id.as_deref(),
                 &sender,
                 &body,
                 &members,
+                mcp_config.as_deref(),
             )
             .await;
         typing.abort();
         let _ = room.typing_notice(false).await;
 
-        if let Err(e) = agent
-            .record(room.room_id(), thread_id.as_deref(), "agent", &answer)
-            .await
-        {
-            eprintln!("could not write transcript: {e}");
+        match ticket {
+            Some(t) if t.count() > 0 => {
+                if !post::is_marker(&answer) {
+                    println!(
+                        "[{}] posted {}; final text not posted: {answer}",
+                        room.room_id(),
+                        t.count()
+                    );
+                }
+            }
+            Some(_) if post::is_marker(&answer) => {
+                // Silence, made visible.
+                let mark = ReactionEventContent::new(Annotation::new(reply_to.clone(), "✓".into()));
+                if let Err(e) = room.send(mark).await {
+                    eprintln!("could not react: {e}");
+                }
+            }
+            // Text mode, or a tool-mode run that posted nothing but said
+            // something (an error, or a model that forgot the tool).
+            _ => {
+                if let Err(e) = agent
+                    .record(room.room_id(), thread_id.as_deref(), "agent", &answer)
+                    .await
+                {
+                    eprintln!("could not write transcript: {e}");
+                }
+                send(answer).await;
+            }
         }
-        send(answer).await;
         // A `digest` room updates its notes, a `layered` one its summaries, now that the answer is out.
         agent.reflect(room.room_id()).await;
 

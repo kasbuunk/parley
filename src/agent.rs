@@ -96,6 +96,17 @@ pub struct Profile {
     /// Folder for the `layered` mode's summary notes. Default: the room's
     /// `summaries/`. Kas's vault: `…/life/ai/rooms/<name>`.
     pub summaries: Option<PathBuf>,
+    /// How the agent speaks: `text` posts the run's final answer; `tool`
+    /// gives it a `post` tool instead (see `post.rs`).
+    pub reply: ReplyMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplyMode {
+    #[default]
+    Text,
+    Tool,
 }
 
 impl Default for Profile {
@@ -115,6 +126,7 @@ impl Default for Profile {
             timeout_secs: 300,
             name: None,
             summaries: None,
+            reply: ReplyMode::Text,
         }
     }
 }
@@ -136,6 +148,9 @@ pub struct Run<'a> {
     pub session: Option<&'a str>,
     /// Whether the harness should keep the session for a later turn.
     pub persist: bool,
+    /// Extra MCP servers for this run (`--mcp-config` JSON), e.g. parley's
+    /// `post` tool.
+    pub mcp_config: Option<&'a str>,
 }
 
 pub struct Output {
@@ -197,6 +212,10 @@ impl ClaudeCode {
         args.extend(["--tools".into(), p.tools.clone()]);
         if !p.mcp {
             args.push("--strict-mcp-config".into());
+        }
+        if let Some(config) = run.mcp_config {
+            args.extend(["--mcp-config".into(), config.into()]);
+            args.extend(["--allowedTools".into(), "mcp__parley__post".into()]);
         }
         args.extend(["--setting-sources".into(), p.settings.join(",")]);
         if p.settings.is_empty() {
@@ -304,6 +323,7 @@ impl<H: Harness> Agent<H> {
     /// The reply to post for `body`, sent by `sender` in `room_id` (in the
     /// thread rooted at `thread`, if any), whose human members (everyone but
     /// the bot) are `members`.
+    #[cfg(test)]
     pub async fn reply(
         &self,
         room_id: &RoomId,
@@ -311,6 +331,22 @@ impl<H: Harness> Agent<H> {
         sender: &str,
         body: &str,
         members: &[OwnedUserId],
+    ) -> String {
+        self.reply_with(room_id, thread, sender, body, members, None)
+            .await
+    }
+
+    /// [`Agent::reply`], giving the run the extra MCP servers in
+    /// `mcp_config`; with one, the system prompt tells the agent to post
+    /// with the `post` tool.
+    pub async fn reply_with(
+        &self,
+        room_id: &RoomId,
+        thread: Option<&str>,
+        sender: &str,
+        body: &str,
+        members: &[OwnedUserId],
+        mcp_config: Option<&str>,
     ) -> String {
         let lock = self.room_lock(room_id);
         let _turn = lock.lock().await;
@@ -322,7 +358,10 @@ impl<H: Harness> Agent<H> {
             );
         }
 
-        match self.run(room_id, thread, sender, body, members).await {
+        match self
+            .run(room_id, thread, sender, body, members, mcp_config)
+            .await
+        {
             Ok(text) => {
                 self.breaker.lock().unwrap().success();
                 text
@@ -487,6 +526,7 @@ impl<H: Harness> Agent<H> {
                         input: &job.input,
                         session: None,
                         persist: false,
+                        mcp_config: None,
                     })
                     .await?;
                 if out.text.trim().is_empty() {
@@ -520,6 +560,7 @@ impl<H: Harness> Agent<H> {
                 input: &input,
                 session: None,
                 persist: false,
+                mcp_config: None,
             })
             .await?;
         if out.text.trim().is_empty() {
@@ -582,6 +623,17 @@ impl<H: Harness> Agent<H> {
         std::fs::remove_file(base.join("restart")).is_ok()
     }
 
+    /// Whether the room's profile says to post with the `post` tool rather
+    /// than the run's final text. A missing or broken profile says no.
+    pub async fn replies_with_tool(&self, room_id: &RoomId) -> bool {
+        match self.room_dir(room_id) {
+            Ok(dir) => Self::profile(&dir)
+                .await
+                .is_ok_and(|p| p.reply == ReplyMode::Tool),
+            Err(_) => false,
+        }
+    }
+
     /// Whether the room's profile says to answer main-timeline messages in
     /// a new thread. A missing or broken profile says no.
     pub async fn starts_threads(&self, room_id: &RoomId) -> bool {
@@ -628,6 +680,7 @@ impl<H: Harness> Agent<H> {
         sender: &str,
         body: &str,
         members: &[OwnedUserId],
+        mcp_config: Option<&str>,
     ) -> Result<String> {
         let dir = self.room_dir(room_id)?;
         tokio::fs::create_dir_all(&dir).await?;
@@ -657,6 +710,10 @@ impl<H: Harness> Agent<H> {
                 DEFAULT_SYSTEM_PROMPT.to_owned()
             }
             Err(e) => return Err(e).context("could not read SYSTEM.md"),
+        };
+        let system_prompt = match mcp_config {
+            Some(_) => system_prompt + crate::post::PROMPT_NOTE,
+            None => system_prompt,
         };
 
         let (mode, _) = Self::mode(&dir, &profile).await?;
@@ -707,6 +764,7 @@ impl<H: Harness> Agent<H> {
             input: &input,
             session: session.as_deref(),
             persist: mode.resumes(),
+            mcp_config,
         };
         match self.harness.run(&run).await {
             Ok(out) => {
@@ -854,6 +912,7 @@ mod tests {
                 input,
                 session: None,
                 persist: false,
+                mcp_config: None,
             };
             match tokio::time::timeout(self.1, self.0.run(&run)).await {
                 Ok(r) => r.map(|o| o.text),
@@ -981,6 +1040,24 @@ echo '{{"result":"ok"}}'"#,
                 "<json>",
             ]
         );
+    }
+
+    #[test]
+    fn mcp_config_is_passed_with_the_post_tool_allowed() {
+        let profile = Profile::default();
+        let run = Run {
+            profile: &profile,
+            system_prompt: "s",
+            workdir: Path::new("/"),
+            input: "x",
+            session: None,
+            persist: false,
+            mcp_config: Some("{}"),
+        };
+        let args = ClaudeCode::args(&run);
+        let at = args.iter().position(|a| a == "--mcp-config").unwrap();
+        assert_eq!(args[at + 1], "{}");
+        assert!(args.contains(&"mcp__parley__post".to_owned()));
     }
 
     // ---- Agent with a fake harness ----
