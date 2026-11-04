@@ -476,8 +476,10 @@ async fn tool_turn(
     room: &Room,
     here: &Option<OwnedEventId>,
     reply_to: &Option<OwnedEventId>,
+    depth: u32,
 ) -> Result<post::Turn> {
     let thread_id = here.as_ref().map(|t| t.as_str());
+    let max_depth = agent.max_depth(room.room_id()).await;
     let (access, problems) = agent.access(room.room_id(), thread_id).await?;
     for p in problems {
         eprintln!("[{}] access: {p}", room.room_id());
@@ -534,6 +536,8 @@ async fn tool_turn(
         send,
         read,
         schedules: tooling.schedules.clone(),
+        depth,
+        max_depth,
     })
 }
 /// The joined room with this ID.
@@ -715,7 +719,17 @@ async fn on_message(
             .track(
                 room_id,
                 thread_id,
-                answer(client, agent, t, room, thread, Some(reply_to), sender, body),
+                answer(
+                    client,
+                    agent,
+                    t,
+                    room,
+                    thread,
+                    Some(reply_to),
+                    sender,
+                    body,
+                    0,
+                ),
             )
             .await;
     });
@@ -827,6 +841,7 @@ async fn answer(
     reply_to: Option<OwnedEventId>,
     sender: String,
     body: String,
+    depth: u32,
 ) {
     let thread_id = thread.as_ref().map(|t| t.as_str().to_owned());
     let me = client.user_id().map(ToOwned::to_owned);
@@ -850,7 +865,7 @@ async fn answer(
     };
     // A `reply = "tool"` room posts (and reads) with tools while it runs.
     let ticket = if agent.replies_with_tool(room.room_id()).await {
-        match tool_turn(&client, &agent, &tooling, &room, &thread, &reply_to)
+        match tool_turn(&client, &agent, &tooling, &room, &thread, &reply_to, depth)
             .await
             .and_then(|turn| tooling.posts.register(turn))
         {
@@ -977,6 +992,8 @@ async fn fire(
         .and_then(|b| std::fs::read_to_string(b).ok());
     let body = schedule::fire_message(&job, board.as_deref());
     let who = format!("schedule {}", job.id);
+    // Schedules this run makes are one generation further.
+    let depth = job.depth + 1;
     if let Err(e) = agent
         .record(room.room_id(), job.thread.as_deref(), &who, &body)
         .await
@@ -989,7 +1006,7 @@ async fn fire(
         .track(
             room.room_id().to_owned(),
             job.thread.clone(),
-            answer(client, agent, t, room, thread, None, who, body),
+            answer(client, agent, t, room, thread, None, who, body, depth),
         )
         .await;
 }

@@ -65,7 +65,18 @@ pub struct Job {
     pub created: DateTime<Utc>,
     /// Who made it: a user ID, or `agent`.
     pub by: String,
+    /// Its generation: 0 when made in a run a person started, one more
+    /// than the firing schedule's when made in a scheduled run. Parley
+    /// refuses schedules above the room's `max_depth`, so schedules that
+    /// make schedules cannot loop forever.
+    #[serde(default)]
+    pub depth: u32,
 }
+
+/// At most this many live schedules per room.
+pub const MAX_LIVE: usize = 20;
+/// Two fires of one schedule are at least this far apart.
+pub const MIN_GAP_SECS: i64 = 60;
 
 /// What the `schedule` tool asks for, before it is a [`Job`].
 #[derive(Debug, Clone, Default)]
@@ -132,7 +143,7 @@ impl Request {
             (Some(_), Some(_)) => bail!("give `every` or `cron`, not both"),
             (Some(every), None) => {
                 let secs = parse_duration(every)?;
-                if secs < 60 {
+                if (secs as i64) < MIN_GAP_SECS {
                     bail!("`every` must be at least a minute");
                 }
                 let first = start.unwrap_or(now + chrono::Duration::seconds(secs as i64));
@@ -142,8 +153,16 @@ impl Request {
                 if start.is_some() {
                     bail!("`cron` takes no `at` or `in`");
                 }
-                expr.parse::<cron::Schedule>()
+                let sched = expr
+                    .parse::<cron::Schedule>()
                     .map_err(|e| anyhow::anyhow!("bad cron expression {expr:?}: {e}"))?;
+                let fires: Vec<_> = sched.after(&now.with_timezone(&Local)).take(50).collect();
+                if fires
+                    .windows(2)
+                    .any(|w| (w[1] - w[0]).num_seconds() < MIN_GAP_SECS)
+                {
+                    bail!("`cron` must not fire more often than once a minute");
+                }
                 (When::Cron { expr: expr.clone() }, self.times)
             }
             (None, None) => match start {
@@ -164,6 +183,7 @@ impl Request {
             since: now,
             created: now,
             by: by.to_owned(),
+            depth: 0,
         };
         job.next = job.first();
         if job.next.is_none() {
@@ -236,8 +256,13 @@ impl Job {
         } else {
             ""
         };
+        let generation = if self.depth > 0 {
+            format!(", generation {}", self.depth)
+        } else {
+            String::new()
+        };
         format!(
-            "`{}` {when}, {runs}, {next}{gate} ({place}): {}",
+            "`{}` {when}, {runs}, {next}{gate}{generation} ({place}): {}",
             self.id,
             self.prompt.lines().next().unwrap_or("")
         )
@@ -361,8 +386,12 @@ impl Store {
         Ok(())
     }
 
+    /// Save a new schedule, unless its room already has [`MAX_LIVE`].
     pub fn create(&self, job: &Job) -> Result<()> {
         let _g = self.lock.lock().unwrap();
+        if Self::load(&self.dir(&job.room)?).len() >= MAX_LIVE {
+            bail!("this room already has {MAX_LIVE} live schedules; cancel one first");
+        }
         self.save(job)?;
         self.wake.notify_one();
         Ok(())
@@ -620,6 +649,29 @@ mod tests {
             json!({"prompt": "p", "at": "2026-11-04 21:00", "in": "5m"})
         ));
         assert!(bad(json!({"prompt": "p", "in": "5m", "times": 0})));
+        // Faster than once a minute, by seconds or by a dense minute.
+        assert!(bad(json!({"prompt": "p", "cron": "* * * * * *"})));
+        assert!(bad(json!({"prompt": "p", "cron": "0,30 * * * * *"})));
+        assert!(!bad(json!({"prompt": "p", "cron": "0 * * * * *"})));
+    }
+
+    #[test]
+    fn a_room_holds_at_most_max_live_schedules() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_owned());
+        let now = Utc::now();
+        let job = |i: usize| {
+            req(json!({"prompt": "p", "in": "1h"}))
+                .job(format!("j{i}"), "!r:x", None, "agent", now)
+                .unwrap()
+        };
+        for i in 0..MAX_LIVE {
+            store.create(&job(i)).unwrap();
+        }
+        let e = store.create(&job(MAX_LIVE)).unwrap_err().to_string();
+        assert!(e.contains("cancel one first"), "{e}");
+        store.cancel("!r:x", "j0").unwrap();
+        store.create(&job(MAX_LIVE)).unwrap();
     }
 
     #[test]

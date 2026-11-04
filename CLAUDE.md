@@ -57,6 +57,10 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
   a fire, without an agent, when no person wrote since the last run. A
   scheduler loop in `main.rs` fires them through the same path as a
   message. `trigger = "schedule"` in room.toml: messages start no run.
+  Loop guard: each schedule has a generation (`depth`: 0 when made in a
+  run a person started, the firing schedule's plus one in a scheduled
+  run); `schedule` refuses above room.toml's `max_depth` (default 10).
+  At most 20 live schedules per room, fires at least a minute apart.
 - `src/breaker.rs`: the circuit breaker (also used for the Matrix sync loop).
 
 ## State on the lab

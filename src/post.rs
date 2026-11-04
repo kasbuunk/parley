@@ -84,6 +84,11 @@ pub struct Turn {
     pub read: ReadFn,
     /// Where the `schedule` tools keep their schedules.
     pub schedules: Arc<schedule::Store>,
+    /// The generation a schedule made in this turn gets: 0 in a run a
+    /// person started, the firing schedule's plus one in a scheduled run.
+    pub depth: u32,
+    /// The highest generation this room allows.
+    pub max_depth: u32,
 }
 
 struct Entry {
@@ -199,13 +204,23 @@ impl Posts {
                     None => Scope::Main,
                 };
                 a.check(&room, &scope, true)?;
-                let job = schedule::Request::from_args(args)?.job(
+                if turn.depth > turn.max_depth {
+                    bail!(
+                        "refused: this run was started by a chain of {} schedules, and this \
+                         room allows at most {} (`max_depth` in room.toml). Ask Kas to \
+                         raise it, or finish here.",
+                        turn.depth,
+                        turn.max_depth
+                    );
+                }
+                let mut job = schedule::Request::from_args(args)?.job(
                     schedule::new_id()?,
                     &room,
                     thread.as_deref(),
                     "agent",
                     chrono::Utc::now(),
                 )?;
+                job.depth = turn.depth;
                 turn.schedules.create(&job)?;
                 Ok(format!("Scheduled: {}", job.describe()))
             }
@@ -695,6 +710,8 @@ mod tests {
                 })
             }),
             schedules: Arc::new(schedule::Store::new(rooms.to_owned())),
+            depth: 0,
+            max_depth: 10,
         }
     }
 
@@ -807,6 +824,28 @@ mod tests {
         assert!(r.contains("fires no more"), "{r}");
         let list = call("schedules", json!({})).await.unwrap().unwrap();
         assert!(list.starts_with("No schedules"), "{list}");
+
+        // A run at the end of a chain of schedules may not make another;
+        // one within the limit makes the next generation.
+        let deep = |depth| {
+            let mut t = turn(got.clone(), Arc::default(), tmp.path());
+            t.depth = depth;
+            posts.register(t).unwrap()
+        };
+        let (over, within) = (deep(11), deep(10));
+        let call_as = |tok: String, args: Value| {
+            let s = sock.clone();
+            tokio::task::spawn_blocking(move || call_socket(&s, &tok, "schedule", &args))
+        };
+        let args = json!({"prompt": "again", "in": "1h"});
+        let e = call_as(over.token.clone(), args.clone())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(e.contains("max_depth"), "{e}");
+        let r = call_as(within.token.clone(), args).await.unwrap().unwrap();
+        assert!(r.contains("generation 10"), "{r}");
+        drop((over, within));
 
         drop(ticket);
         let e = call("post", json!({"body": "late"}))

@@ -105,6 +105,9 @@ pub struct Profile {
     /// What starts a run: every message (`message`, the default), or only
     /// schedules (`schedule`; messages are recorded, and commands work).
     pub trigger: Trigger,
+    /// How many generations of schedules may make schedules (see
+    /// `schedule::Job::depth`). Default 10.
+    pub max_depth: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -143,6 +146,7 @@ impl Default for Profile {
             reply: ReplyMode::Text,
             access: Vec::new(),
             trigger: Trigger::Message,
+            max_depth: 10,
         }
     }
 }
@@ -641,6 +645,14 @@ impl<H: Harness> Agent<H> {
 
     /// Whether the room's profile says to post with the `post` tool rather
     /// than the run's final text. A missing or broken profile says no.
+    /// The room's `max_depth` (the default for a room without a profile).
+    pub async fn max_depth(&self, room_id: &RoomId) -> u32 {
+        match self.room_dir(room_id) {
+            Ok(dir) => Self::profile(&dir).await.unwrap_or_default().max_depth,
+            Err(_) => Profile::default().max_depth,
+        }
+    }
+
     pub async fn replies_with_tool(&self, room_id: &RoomId) -> bool {
         match self.room_dir(room_id) {
             Ok(dir) => Self::profile(&dir)
