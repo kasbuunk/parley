@@ -88,6 +88,10 @@ To roll back: `git revert`, build, restart, or point
 
 The NixOS side (the systemd unit) lives in `~/.config/nixos/modules/parley.nix`.
 
+Never `cargo run` (or start any second parley) on the lab: it logs in
+with the same session and store, and rebinds `post.sock`, so the running
+bot's tools stop working until it restarts.
+
 ## Conventions
 
 - Rust edition 2024, `cargo fmt`, no new clippy warnings.
