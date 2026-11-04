@@ -47,6 +47,16 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
 - `src/read.rs`: the `read` tool's paging and filters. It reads from the
   Matrix server (`/messages`, or `/relations` for a thread), so it reaches
   back to a room's first message; a cursor (`<skip>:<token>`) resumes a page.
+- `src/schedule.rs`: schedules, runs that start without a message. Kinds
+  from transmit (`at`/`in` once, `every`, `cron` in local time with
+  seconds; `times` or forever). MCP tools `schedule`, `schedules`,
+  `cancel`, `handoff`; room commands `!schedules`, `!cancel <id>`, and
+  `!stop` (kills this conversation's run). Stored per room as
+  `schedules/<id>.json` (done ones in `schedules/done/`), with `<id>.md`
+  as the handoff scratchboard shown to the next run. `only_if_new` skips
+  a fire, without an agent, when no person wrote since the last run. A
+  scheduler loop in `main.rs` fires them through the same path as a
+  message. `trigger = "schedule"` in room.toml: messages start no run.
 - `src/breaker.rs`: the circuit breaker (also used for the Matrix sync loop).
 
 ## State on the lab
@@ -62,6 +72,7 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
     Without it a room is locked down: no tools, no settings, no memory.
   - `SYSTEM.md`: system prompt (replaces or is appended, per `prompt`).
   - `session`, `threads/<root event id>.session`: Claude session IDs.
+  - `schedules/`: the room's schedules (see `src/schedule.rs`).
   - `transcript.jsonl`: every message and reply, one JSON object per line
     (`ts` unix seconds, `sender`, `thread`, `body`). Not sent to the model.
     Read or grep it to look back at earlier conversations, in this room or

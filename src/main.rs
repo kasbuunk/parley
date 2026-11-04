@@ -35,9 +35,11 @@ mod layered;
 mod memory;
 mod post;
 mod read;
+mod schedule;
 
 use std::{
     env,
+    future::Future,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
@@ -58,7 +60,7 @@ use matrix_sdk::{
     },
     event_handler::Ctx,
     ruma::{
-        OwnedEventId, OwnedUserId, RoomId,
+        OwnedEventId, OwnedRoomId, OwnedUserId, RoomId,
         api::{client::uiaa, error::ErrorKind},
         events::key::verification::request::ToDeviceKeyVerificationRequestEvent,
         events::reaction::ReactionEventContent,
@@ -176,21 +178,23 @@ async fn main() -> Result<()> {
             async move { on_invite(ev, client, room, &allowed).await }
         },
     );
-    let agent = Agent::new(
+    let agent = Arc::new(Agent::new(
         ClaudeCode {
             program: config.claude.clone(),
         },
         config.data_dir.join("rooms"),
-    );
-    client.add_event_handler_context(Arc::new(agent));
+    ));
+    client.add_event_handler_context(agent.clone());
     // The socket the `post` tool talks to (see post.rs).
-    let tooling = Tooling {
+    let tooling = Arc::new(Tooling {
         posts: Arc::new(post::Posts::default()),
         socket: config.data_dir.join("post.sock"),
         exe: env::current_exe().context("cannot find parley's own program")?,
-    };
+        schedules: Arc::new(schedule::Store::new(config.data_dir.join("rooms"))),
+        runs: Runs::default(),
+    });
     post::listen(&tooling.socket, tooling.posts.clone())?;
-    client.add_event_handler_context(Arc::new(tooling));
+    client.add_event_handler_context(tooling.clone());
     client.add_event_handler(on_message);
     let allowed = config.allowed.clone();
     client.add_event_handler(
@@ -212,6 +216,7 @@ async fn main() -> Result<()> {
         },
     );
 
+    tokio::spawn(scheduler(client.clone(), agent, tooling));
     println!("listening");
     sync_forever(&client, SyncSettings::default().token(response.next_batch)).await
 }
@@ -352,51 +357,127 @@ async fn on_invite(
     }
 }
 
-/// What a `reply = "tool"` room's runs need to post.
+/// What runs need besides the agent: posting tools, schedules, and the
+/// runs going on now (for `!stop`).
 struct Tooling {
     posts: Arc<post::Posts>,
     socket: PathBuf,
     /// This program, started as `parley mcp` for each run.
     exe: PathBuf,
+    schedules: Arc<schedule::Store>,
+    runs: Runs,
 }
 
-/// The content of a post to `target`, for a turn answering `reply_to` in
-/// the conversation `here` (a thread root, or the main timeline).
+/// The runs going on (or waiting for their room's turn), so `!stop` can
+/// kill them. Aborting a run's task drops its `claude` child, which kills it.
+#[derive(Default)]
+struct Runs {
+    next: std::sync::atomic::AtomicU64,
+    #[allow(clippy::type_complexity)]
+    live: Mutex<
+        std::collections::HashMap<u64, (OwnedRoomId, Option<String>, tokio::task::AbortHandle)>,
+    >,
+}
+
+impl Runs {
+    /// Run `fut` as the run of `room`'s conversation `thread`, until it ends
+    /// or is stopped.
+    async fn track(
+        &self,
+        room: OwnedRoomId,
+        thread: Option<String>,
+        fut: impl Future<Output = ()> + Send + 'static,
+    ) {
+        let task = tokio::spawn(fut);
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.live
+            .lock()
+            .unwrap()
+            .insert(id, (room, thread, task.abort_handle()));
+        let _ = task.await;
+        self.live.lock().unwrap().remove(&id);
+    }
+
+    /// Kill the runs of `room`'s conversation `thread`; how many there were.
+    fn stop(&self, room: &RoomId, thread: Option<&str>) -> usize {
+        let mut live = self.live.lock().unwrap();
+        let ids: Vec<u64> = live
+            .iter()
+            .filter(|(_, (r, t, _))| r == room && t.as_deref() == thread)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &ids {
+            if let Some((_, _, h)) = live.remove(id) {
+                h.abort();
+            }
+        }
+        ids.len()
+    }
+}
+
+/// Shows "typing…" in a room until dropped (a notice lasts ~4 s).
+struct Typing(tokio::task::JoinHandle<()>);
+
+impl Typing {
+    fn start(room: &Room) -> Self {
+        let room = room.clone();
+        Self(tokio::spawn(async move {
+            loop {
+                let _ = room.typing_notice(true).await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        }))
+    }
+}
+
+impl Drop for Typing {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The content of a post to `target`, for a turn in the conversation
+/// `here` (a thread root, or the main timeline) answering `reply_to` (a
+/// message, or nothing for a schedule's run).
 fn post_content(
     body: String,
     target: &post::Target,
     here: Option<&OwnedEventId>,
-    reply_to: &OwnedEventId,
+    reply_to: Option<&OwnedEventId>,
 ) -> Result<(RoomMessageEventContent, Option<String>)> {
     let mut content = RoomMessageEventContent::text_markdown(body);
-    let (root, latest) = match target {
-        post::Target::Here => match here {
-            Some(root) => (Some(root.clone()), reply_to.clone()),
-            None => (None, reply_to.clone()),
-        },
-        post::Target::Main => (None, reply_to.clone()),
+    let root = match target {
+        post::Target::Here => here.cloned(),
+        post::Target::Main => None,
         post::Target::Thread(t) => {
-            let root: OwnedEventId = t.as_str().try_into().context("bad thread ID")?;
-            (Some(root.clone()), root)
+            Some(OwnedEventId::try_from(t.as_str()).context("bad thread ID")?)
         }
     };
     let thread = root.as_ref().map(|r| r.as_str().to_owned());
     if let Some(root) = root {
+        // In its own thread a post follows the message it answers; elsewhere
+        // (or without one) the thread's root.
+        let latest = match (target, reply_to) {
+            (post::Target::Here, Some(r)) => r.clone(),
+            _ => root.clone(),
+        };
         content.relates_to = Some(Relation::Thread(Thread::plain(root, latest)));
     }
     Ok((content, thread))
 }
 
-/// The tools of a turn in `room` answering `reply_to` in `here` (a thread
-/// root, or the main timeline): its access rules, posting, and reading.
+/// The tools of a turn in `room`, in the conversation `here` (a thread
+/// root, or the main timeline), answering `reply_to`: its access rules,
+/// posting, reading and schedules.
 async fn tool_turn(
     client: &Client,
     agent: &Arc<Agent<ClaudeCode>>,
+    tooling: &Tooling,
     room: &Room,
-    thread_id: Option<&str>,
     here: &Option<OwnedEventId>,
-    reply_to: &OwnedEventId,
+    reply_to: &Option<OwnedEventId>,
 ) -> Result<post::Turn> {
+    let thread_id = here.as_ref().map(|t| t.as_str());
     let (access, problems) = agent.access(room.room_id(), thread_id).await?;
     for p in problems {
         eprintln!("[{}] access: {p}", room.room_id());
@@ -420,7 +501,7 @@ async fn tool_turn(
             let room = joined(&c, &p.room)?;
             let body = p.body.clone();
             let (content, thread) = if room.room_id() == home {
-                post_content(p.body, &p.target, here.as_ref(), &reply_to)?
+                post_content(p.body, &p.target, here.as_ref(), reply_to.as_ref())?
             } else {
                 // Another room: `Here` was made `Main` already; there is no
                 // message to reply to there.
@@ -428,7 +509,7 @@ async fn tool_turn(
                     post::Target::Here => post::Target::Main,
                     t => t,
                 };
-                post_content_elsewhere(p.body, &target)?
+                post_content(p.body, &target, None, None)?
             };
             let sent = room.send(content).await?;
             if let Err(e) = agent
@@ -448,9 +529,13 @@ async fn tool_turn(
             read_page(&room, &q).await
         })
     });
-    Ok(post::Turn { access, send, read })
+    Ok(post::Turn {
+        access,
+        send,
+        read,
+        schedules: tooling.schedules.clone(),
+    })
 }
-
 /// The joined room with this ID.
 fn joined(client: &Client, id: &str) -> Result<Room> {
     let id: &RoomId = id.try_into().context("bad room ID")?;
@@ -458,23 +543,6 @@ fn joined(client: &Client, id: &str) -> Result<Room> {
         Some(r) if r.state() == RoomState::Joined => Ok(r),
         _ => anyhow::bail!("parley is not in room {id}"),
     }
-}
-
-/// A post to `target` of a room the turn does not answer in.
-fn post_content_elsewhere(
-    body: String,
-    target: &post::Target,
-) -> Result<(RoomMessageEventContent, Option<String>)> {
-    let mut content = RoomMessageEventContent::text_markdown(body);
-    let thread = match target {
-        post::Target::Thread(t) => {
-            let root: OwnedEventId = t.as_str().try_into().context("bad thread ID")?;
-            content.relates_to = Some(Relation::Thread(Thread::plain(root.clone(), root)));
-            Some(t.clone())
-        }
-        _ => None,
-    };
-    Ok((content, thread))
 }
 
 /// One page of `room`'s history for the `read` tool. A thread is read
@@ -559,7 +627,8 @@ async fn read_page(room: &Room, q: &read::Query) -> Result<read::Page> {
     .await
 }
 
-/// Answer every text message from someone else with an agent run.
+/// Answer every text message from someone else with an agent run (or, in
+/// a `trigger = "schedule"` room, only record it).
 async fn on_message(
     ev: OriginalSyncRoomMessageEvent,
     room: Room,
@@ -594,40 +663,17 @@ async fn on_message(
         _ => None,
     };
     let reply_to = ev.event_id.clone();
-    let me = client.user_id().map(ToOwned::to_owned);
-    let is_new = body.trim().eq_ignore_ascii_case("!new");
-    // `!context` or `!context <mode>`: show or switch the room's context mode.
-    let context_arg = body
-        .trim()
-        .strip_prefix("!context")
-        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-        .map(|rest| rest.trim().to_owned());
-    let is_command = is_new || context_arg.is_some();
+    let command = Command::parse(&body);
 
     // Runs take seconds; don't hold up the sync loop meanwhile.
     tokio::spawn(async move {
         // A room with `threads` answers a main-timeline message in a new
         // thread rooted at that message (but commands stay where they are).
         let thread = match thread {
-            None if !is_command && agent.starts_threads(room.room_id()).await => {
+            None if command.is_none() && agent.starts_threads(room.room_id()).await => {
                 Some(reply_to.clone())
             }
             t => t,
-        };
-        let send = |text: String| {
-            let mut content = RoomMessageEventContent::text_markdown(text);
-            if let Some(root) = &thread {
-                content.relates_to = Some(Relation::Thread(Thread::plain(
-                    root.clone(),
-                    reply_to.clone(),
-                )));
-            }
-            let room = room.clone();
-            async move {
-                if let Err(e) = room.send(content).await {
-                    eprintln!("send failed: {e}");
-                }
-            }
         };
         let thread_id = thread.as_ref().map(|t| t.as_str().to_owned());
         if let Err(e) = agent
@@ -642,29 +688,19 @@ async fn on_message(
             eprintln!("could not write transcript: {e}");
         }
 
-        if is_new {
-            let text = match agent.reset(room.room_id(), thread_id.as_deref()).await {
-                Ok(Some(old)) => match old.messages {
-                    Some(1) => "_New session (the old one had 1 message): the next message starts fresh._".to_owned(),
-                    Some(n) => format!("_New session (the old one had {n} messages): the next message starts fresh._"),
-                    None => "_New session (the old one's message count is unknown): the next message starts fresh._".to_owned(),
-                },
-                Ok(None) => {
-                    "_There was no session yet; the next message starts fresh._".to_owned()
-                }
-                Err(e) => format!("_Could not reset the session: {e}_"),
-            };
-            send(text).await;
+        if let Some(command) = command {
+            let text = run_command(
+                &agent,
+                &tooling,
+                room.room_id(),
+                thread_id.as_deref(),
+                command,
+            )
+            .await;
+            send_text(&room, text, thread.as_ref(), Some(&reply_to)).await;
             return;
         }
-
-        if let Some(arg) = context_arg {
-            let arg = Some(arg.as_str()).filter(|a| !a.is_empty());
-            let text = match agent.context(room.room_id(), arg).await {
-                Ok(text) => text,
-                Err(e) => format!("_{e}_\n\n{}", memory::Mode::HELP),
-            };
-            send(text).await;
+        if !agent.runs_on_messages(room.room_id()).await {
             return;
         }
 
@@ -672,111 +708,290 @@ async fn on_message(
             Ok(Some(member)) => member.name().to_owned(),
             _ => ev.sender.localpart().to_owned(),
         };
-
-        // Show "typing…" until the answer is there (a notice lasts ~4 s).
-        let typing_room = room.clone();
-        let typing = tokio::spawn(async move {
-            loop {
-                let _ = typing_room.typing_notice(true).await;
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
-        });
-        // Everyone who is or may soon be in the room, except the bot.
-        let members: Vec<OwnedUserId> = match room.members(RoomMemberships::ACTIVE).await {
-            Ok(list) => list
-                .iter()
-                .map(|m| m.user_id().to_owned())
-                .filter(|id| Some(id) != me.as_ref())
-                .collect(),
-            Err(e) => {
-                eprintln!("could not list members: {e}");
-                let _ = room
-                    .send(RoomMessageEventContent::text_plain(
-                        "Could not check who is in this room; not running.",
-                    ))
-                    .await;
-                typing.abort();
-                return;
-            }
-        };
-        // A `reply = "tool"` room posts (and reads) with tools while it runs.
-        let ticket = if agent.replies_with_tool(room.room_id()).await {
-            match tool_turn(
-                &client,
-                &agent,
-                &room,
-                thread_id.as_deref(),
-                &thread,
-                &reply_to,
-            )
-            .await
-            .and_then(|turn| tooling.posts.register(turn))
-            {
-                Ok(t) => Some(t),
-                Err(e) => {
-                    eprintln!("could not set up the tools, answering as text: {e:#}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let mcp_config = ticket
-            .as_ref()
-            .map(|t| post::mcp_config(&tooling.exe, &tooling.socket, &t.token));
-        let answer = agent
-            .reply_with(
-                room.room_id(),
-                thread_id.as_deref(),
-                &sender,
-                &body,
-                &members,
-                mcp_config.as_deref(),
+        let room_id = room.room_id().to_owned();
+        let t = tooling.clone();
+        tooling
+            .runs
+            .track(
+                room_id,
+                thread_id,
+                answer(client, agent, t, room, thread, Some(reply_to), sender, body),
             )
             .await;
-        typing.abort();
-        let _ = room.typing_notice(false).await;
+    });
+}
 
-        match ticket {
-            Some(t) if t.count() > 0 => {
-                if !post::is_marker(&answer) {
-                    println!(
-                        "[{}] posted {}; final text not posted: {answer}",
-                        room.room_id(),
-                        t.count()
-                    );
-                }
+/// A `!` command: handled by parley itself, without an agent.
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    /// `!new`: forget this conversation's session.
+    New,
+    /// `!context [mode]`: show or switch the room's context mode.
+    Context(Option<String>),
+    /// `!stop`: kill this conversation's run.
+    Stop,
+    /// `!schedules`: list the room's schedules.
+    Schedules,
+    /// `!cancel <id>`: end a schedule.
+    Cancel(String),
+}
+
+impl Command {
+    fn parse(body: &str) -> Option<Self> {
+        let body = body.trim();
+        let (word, rest) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
+        let rest = rest.trim();
+        let arg = Some(rest.to_owned()).filter(|r| !r.is_empty());
+        match word.to_ascii_lowercase().as_str() {
+            "!new" if arg.is_none() => Some(Self::New),
+            "!context" => Some(Self::Context(arg)),
+            "!stop" if arg.is_none() => Some(Self::Stop),
+            "!schedules" if arg.is_none() => Some(Self::Schedules),
+            "!cancel" => Some(Self::Cancel(rest.to_owned())),
+            _ => None,
+        }
+    }
+}
+
+/// What parley answers to `command`, sent in `room`'s conversation `thread`.
+async fn run_command(
+    agent: &Agent<ClaudeCode>,
+    tooling: &Tooling,
+    room: &RoomId,
+    thread: Option<&str>,
+    command: Command,
+) -> String {
+    match command {
+        Command::New => match agent.reset(room, thread).await {
+            Ok(Some(old)) => match old.messages {
+                Some(1) => "_New session (the old one had 1 message): the next message starts fresh._".to_owned(),
+                Some(n) => format!("_New session (the old one had {n} messages): the next message starts fresh._"),
+                None => "_New session (the old one's message count is unknown): the next message starts fresh._".to_owned(),
+            },
+            Ok(None) => "_There was no session yet; the next message starts fresh._".to_owned(),
+            Err(e) => format!("_Could not reset the session: {e}_"),
+        },
+        Command::Context(arg) => match agent.context(room, arg.as_deref()).await {
+            Ok(text) => text,
+            Err(e) => format!("_{e}_\n\n{}", memory::Mode::HELP),
+        },
+        Command::Stop => match tooling.runs.stop(room, thread) {
+            0 => "_Nothing is running here._".to_owned(),
+            1 => "_Stopped the run._".to_owned(),
+            n => format!("_Stopped {n} runs._"),
+        },
+        Command::Schedules => match tooling.schedules.list(room.as_str()) {
+            Ok(jobs) if jobs.is_empty() => "_No schedules in this room._".to_owned(),
+            Ok(jobs) => jobs
+                .iter()
+                .map(|j| format!("- {}", j.describe()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(e) => format!("_Could not list the schedules: {e}_"),
+        },
+        Command::Cancel(id) => match tooling.schedules.cancel(room.as_str(), &id) {
+            Ok(_) => format!("_Cancelled `{id}`; it fires no more._"),
+            Err(e) => format!("_Could not cancel: {e}_"),
+        },
+    }
+}
+
+/// Post `text` in `room`'s conversation `thread`, after `reply_to`.
+async fn send_text(
+    room: &Room,
+    text: String,
+    thread: Option<&OwnedEventId>,
+    reply_to: Option<&OwnedEventId>,
+) {
+    let content = match post_content(text, &post::Target::Here, thread, reply_to) {
+        Ok((c, _)) => c,
+        Err(e) => {
+            eprintln!("bad post: {e}");
+            return;
+        }
+    };
+    if let Err(e) = room.send(content).await {
+        eprintln!("send failed: {e}");
+    }
+}
+
+/// One agent run in `room`'s conversation `thread`: for the message
+/// `reply_to` from `sender`, or (with none) a schedule's.
+#[allow(clippy::too_many_arguments)]
+async fn answer(
+    client: Client,
+    agent: Arc<Agent<ClaudeCode>>,
+    tooling: Arc<Tooling>,
+    room: Room,
+    thread: Option<OwnedEventId>,
+    reply_to: Option<OwnedEventId>,
+    sender: String,
+    body: String,
+) {
+    let thread_id = thread.as_ref().map(|t| t.as_str().to_owned());
+    let me = client.user_id().map(ToOwned::to_owned);
+    let typing = Typing::start(&room);
+    // Everyone who is or may soon be in the room, except the bot.
+    let members: Vec<OwnedUserId> = match room.members(RoomMemberships::ACTIVE).await {
+        Ok(list) => list
+            .iter()
+            .map(|m| m.user_id().to_owned())
+            .filter(|id| Some(id) != me.as_ref())
+            .collect(),
+        Err(e) => {
+            eprintln!("could not list members: {e}");
+            let _ = room
+                .send(RoomMessageEventContent::text_plain(
+                    "Could not check who is in this room; not running.",
+                ))
+                .await;
+            return;
+        }
+    };
+    // A `reply = "tool"` room posts (and reads) with tools while it runs.
+    let ticket = if agent.replies_with_tool(room.room_id()).await {
+        match tool_turn(&client, &agent, &tooling, &room, &thread, &reply_to)
+            .await
+            .and_then(|turn| tooling.posts.register(turn))
+        {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!("could not set up the tools, answering as text: {e:#}");
+                None
             }
-            Some(_) if post::is_marker(&answer) => {
-                // Silence, made visible.
-                let mark = ReactionEventContent::new(Annotation::new(reply_to.clone(), "✓".into()));
+        }
+    } else {
+        None
+    };
+    let mcp_config = ticket
+        .as_ref()
+        .map(|t| post::mcp_config(&tooling.exe, &tooling.socket, &t.token));
+    let answer = agent
+        .reply_with(
+            room.room_id(),
+            thread_id.as_deref(),
+            &sender,
+            &body,
+            &members,
+            mcp_config.as_deref(),
+        )
+        .await;
+    drop(typing);
+    let _ = room.typing_notice(false).await;
+
+    match ticket {
+        Some(t) if t.count() > 0 => {
+            if !post::is_marker(&answer) {
+                println!(
+                    "[{}] posted {}; final text not posted: {answer}",
+                    room.room_id(),
+                    t.count()
+                );
+            }
+        }
+        Some(_) if post::is_marker(&answer) => {
+            // Silence, made visible (a schedule's run has nothing to mark).
+            if let Some(r) = &reply_to {
+                let mark = ReactionEventContent::new(Annotation::new(r.clone(), "✓".into()));
                 if let Err(e) = room.send(mark).await {
                     eprintln!("could not react: {e}");
                 }
             }
-            // Text mode, or a tool-mode run that posted nothing but said
-            // something (an error, or a model that forgot the tool).
-            _ => {
-                if let Err(e) = agent
-                    .record(room.room_id(), thread_id.as_deref(), "agent", &answer)
-                    .await
-                {
-                    eprintln!("could not write transcript: {e}");
-                }
-                send(answer).await;
+        }
+        // Text mode, or a tool-mode run that posted nothing but said
+        // something (an error, or a model that forgot the tool).
+        _ => {
+            if let Err(e) = agent
+                .record(room.room_id(), thread_id.as_deref(), "agent", &answer)
+                .await
+            {
+                eprintln!("could not write transcript: {e}");
             }
+            send_text(&room, answer, thread.as_ref(), reply_to.as_ref()).await;
         }
-        // A `digest` room updates its notes, a `layered` one its summaries, now that the answer is out.
-        agent.reflect(room.room_id()).await;
+    }
+    // A `digest` room updates its notes, a `layered` one its summaries, now that the answer is out.
+    agent.reflect(room.room_id()).await;
 
-        // An agent working on parley itself asks for a restart by creating
-        // `restart` in the data dir; exit only after its reply is out, and
-        // let systemd (Restart=always) start the new build.
-        if agent.take_restart_request() {
-            println!("restart requested by an agent; exiting");
-            std::process::exit(0);
+    // An agent working on parley itself asks for a restart by creating
+    // `restart` in the data dir; exit only after its reply is out, and
+    // let systemd (Restart=always) start the new build.
+    if agent.take_restart_request() {
+        println!("restart requested by an agent; exiting");
+        std::process::exit(0);
+    }
+}
+
+/// Fire due schedules, forever: each starts a run in its room and thread
+/// with the schedule's prompt and handoff as the message.
+async fn scheduler(client: Client, agent: Arc<Agent<ClaudeCode>>, tooling: Arc<Tooling>) {
+    loop {
+        let now = chrono::Utc::now();
+        for job in tooling.schedules.take_due(now) {
+            tokio::spawn(fire(client.clone(), agent.clone(), tooling.clone(), job));
         }
-    });
+        // Wake for the soonest schedule, a new one, or every 30 s at most
+        // (schedules can also be added or edited by hand).
+        let wait = tooling
+            .schedules
+            .soonest()
+            .and_then(|t| (t - chrono::Utc::now()).to_std().ok())
+            .unwrap_or(Duration::ZERO)
+            .clamp(Duration::from_secs(1), Duration::from_secs(30));
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = tooling.schedules.wake.notified() => {}
+        }
+    }
+}
+
+async fn fire(
+    client: Client,
+    agent: Arc<Agent<ClaudeCode>>,
+    tooling: Arc<Tooling>,
+    job: schedule::Job,
+) {
+    let room = match joined(&client, &job.room) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("schedule {} cannot fire: {e}", job.id);
+            return;
+        }
+    };
+    let thread = match job.thread.as_deref().map(OwnedEventId::try_from) {
+        None => None,
+        Some(Ok(t)) => Some(t),
+        Some(Err(e)) => {
+            eprintln!("schedule {} has a bad thread: {e}", job.id);
+            return;
+        }
+    };
+    println!(
+        "[{}] schedule {} fires (run {})",
+        job.room, job.id, job.fired
+    );
+    let board = tooling
+        .schedules
+        .board(&job.room, &job.id)
+        .ok()
+        .and_then(|b| std::fs::read_to_string(b).ok());
+    let body = schedule::fire_message(&job, board.as_deref());
+    let who = format!("schedule {}", job.id);
+    if let Err(e) = agent
+        .record(room.room_id(), job.thread.as_deref(), &who, &body)
+        .await
+    {
+        eprintln!("could not write transcript: {e}");
+    }
+    let t = tooling.clone();
+    tooling
+        .runs
+        .track(
+            room.room_id().to_owned(),
+            job.thread.clone(),
+            answer(client, agent, t, room, thread, None, who, body),
+        )
+        .await;
 }
 
 /// Accept a verification request and drive it through emoji (SAS) comparison.
@@ -906,5 +1121,80 @@ mod tests {
         // An empty value or a trailing comma is an error, not "nobody allowed".
         assert!(parse_allowed("").is_err());
         assert!(parse_allowed("@a:example.org,").is_err());
+    }
+
+    #[test]
+    fn commands() {
+        assert_eq!(Command::parse(" !new "), Some(Command::New));
+        assert_eq!(Command::parse("!new please"), None);
+        assert_eq!(Command::parse("!context"), Some(Command::Context(None)));
+        assert_eq!(
+            Command::parse("!context layered 10"),
+            Some(Command::Context(Some("layered 10".into())))
+        );
+        assert_eq!(Command::parse("!contextual"), None);
+        assert_eq!(Command::parse("!STOP"), Some(Command::Stop));
+        assert_eq!(Command::parse("!schedules"), Some(Command::Schedules));
+        assert_eq!(
+            Command::parse("!cancel ab12"),
+            Some(Command::Cancel("ab12".into()))
+        );
+        assert_eq!(Command::parse("stop"), None);
+    }
+
+    #[test]
+    fn posts_follow_their_message_or_the_root() {
+        let root: OwnedEventId = "$root".try_into().unwrap();
+        let msg: OwnedEventId = "$msg".try_into().unwrap();
+        let latest = |c: &RoomMessageEventContent| match &c.relates_to {
+            Some(Relation::Thread(t)) => Some((
+                t.event_id.to_string(),
+                t.in_reply_to.as_ref().map(|r| r.event_id.to_string()),
+            )),
+            _ => None,
+        };
+        let (c, t) =
+            post_content("x".into(), &post::Target::Here, Some(&root), Some(&msg)).unwrap();
+        assert_eq!(t.as_deref(), Some("$root"));
+        assert_eq!(latest(&c), Some(("$root".into(), Some("$msg".into()))));
+        // A schedule's run has no message: it follows the root.
+        let (c, _) = post_content("x".into(), &post::Target::Here, Some(&root), None).unwrap();
+        assert_eq!(latest(&c), Some(("$root".into(), Some("$root".into()))));
+        let (c, t) =
+            post_content("x".into(), &post::Target::Main, Some(&root), Some(&msg)).unwrap();
+        assert_eq!((latest(&c), t), (None, None));
+    }
+
+    #[tokio::test]
+    async fn stop_kills_only_its_conversation() {
+        let runs = Arc::new(Runs::default());
+        let room: OwnedRoomId = "!r:x".try_into().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let r = runs.clone();
+        let rm = room.clone();
+        let a = tokio::spawn(async move {
+            r.track(rm, Some("$a".into()), async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            })
+            .await
+        });
+        let r = runs.clone();
+        let rm = room.clone();
+        let b = tokio::spawn(async move {
+            r.track(rm, None, async move {
+                let _ = rx.await;
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(runs.stop(&room, Some("$b")), 0);
+        assert_eq!(runs.stop(&room, Some("$a")), 1);
+        tokio::time::timeout(Duration::from_secs(1), a)
+            .await
+            .unwrap()
+            .unwrap();
+        tx.send(()).unwrap();
+        b.await.unwrap();
+        assert!(runs.live.lock().unwrap().is_empty());
     }
 }

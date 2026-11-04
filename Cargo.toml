@@ -7,6 +7,8 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+cron = "0.15"
 dirs = "6"
 futures-util = "0.3"
 matrix-sdk = { version = "0.19.1", features = ["markdown"] }

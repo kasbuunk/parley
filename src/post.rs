@@ -34,7 +34,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use crate::{
     access::{Access, Scope},
-    read,
+    read, schedule,
 };
 
 /// Where in its room a post goes.
@@ -82,6 +82,8 @@ pub struct Turn {
     pub access: Access,
     pub send: SendFn,
     pub read: ReadFn,
+    /// Where the `schedule` tools keep their schedules.
+    pub schedules: Arc<schedule::Store>,
 }
 
 struct Entry {
@@ -179,6 +181,73 @@ impl Posts {
                 Ok(read::render(&room, &q, &page))
             }
             "rooms" => Ok(a.describe()),
+            "schedule" => {
+                let room = a.room(s("room"))?;
+                // Where its runs happen: here by default (in another
+                // room, its main timeline).
+                let thread = match Target::parse(s("thread"))? {
+                    Target::Here if room != a.here => None,
+                    Target::Here => match &a.here_scope {
+                        Scope::Thread(t) => Some(t.clone()),
+                        _ => None,
+                    },
+                    Target::Main => None,
+                    Target::Thread(t) => Some(t),
+                };
+                let scope = match &thread {
+                    Some(t) => Scope::Thread(t.clone()),
+                    None => Scope::Main,
+                };
+                a.check(&room, &scope, true)?;
+                let job = schedule::Request::from_args(args)?.job(
+                    schedule::new_id()?,
+                    &room,
+                    thread.as_deref(),
+                    "agent",
+                    chrono::Utc::now(),
+                )?;
+                turn.schedules.create(&job)?;
+                Ok(format!("Scheduled: {}", job.describe()))
+            }
+            "schedules" => {
+                let room = a.room(s("room"))?;
+                a.check(&room, &Scope::All, false)
+                    .or_else(|_| a.check(&room, &a.here_scope, false))?;
+                let jobs = turn.schedules.list(&room)?;
+                if jobs.is_empty() {
+                    return Ok(format!("No schedules in {room}."));
+                }
+                Ok(jobs
+                    .iter()
+                    .map(|j| format!("- {}", j.describe()))
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            }
+            "cancel" => {
+                let room = a.room(s("room"))?;
+                let id = s("id").context("`id` is required")?;
+                let job = turn
+                    .schedules
+                    .list(&room)?
+                    .into_iter()
+                    .find(|j| j.id == id)
+                    .with_context(|| format!("no schedule {id} in {room}"))?;
+                let scope = match &job.thread {
+                    Some(t) => Scope::Thread(t.clone()),
+                    None => Scope::Main,
+                };
+                a.check(&room, &scope, true)?;
+                turn.schedules.cancel(&room, id)?;
+                Ok(format!("Cancelled `{id}`; it fires no more."))
+            }
+            "handoff" => {
+                let room = a.room(s("room"))?;
+                let id = s("id").context("`id` is required")?;
+                a.check(&room, &a.here_scope, true)
+                    .or_else(|_| a.check(&room, &Scope::Main, true))?;
+                turn.schedules.handoff(&room, id, s("text").unwrap_or(""))?;
+                Ok(format!("Saved; the next run of `{id}` gets it."))
+            }
             _ => bail!("unknown tool {tool:?}"),
         }
     }
@@ -281,7 +350,15 @@ returns a page, newest first unless `order: \"oldest\"`, filtered by \
 `thread` (\"here\", \"main\" or a root event ID), `since`/`until` \
 (YYYY-MM-DD or unix seconds), `sender` and `contains`, with a cursor for \
 the next page. Use it when the past matters instead of guessing. `post` \
-takes a `room` too.\n";
+takes a `room` too.\n\n\
+## Schedules\n\n\
+Your run ends with this turn, but you can plan later ones: `schedule` \
+starts a run at a time (`at`, `in`), repeatedly (`every`, `cron`, with \
+`times`), here or in another room you may post to; `only_if_new` skips a \
+fire when nobody wrote since the last run. `schedules` lists them, \
+`cancel` ends one. For long work, do a step, `handoff` what the next run \
+needs, and schedule it: state lives on, the process does not. A message \
+starting with `[schedule <id>: …]` was sent by a schedule, not a person.\n";
 
 /// The final answers that mean "nothing more to post".
 pub fn is_marker(text: &str) -> bool {
@@ -328,6 +405,40 @@ fn tools() -> Value {
             "name": "rooms",
             "description": "List the rooms this turn may read and post to, and which parts of them.",
             "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
+            "name": "schedule",
+            "description": "Plan a run for later, once or repeatedly. When it fires, an agent run starts in that room and thread with `prompt` as its message (with the previous run's handoff), as if someone had sent it; the run lasts one turn, like any other. Say when with exactly one of: `at` or `in` (once), `every` (repeatedly; optionally starting at `at`/`in`), or `cron`. Use it to follow up later, to check something periodically, or to continue long work in steps (leave state with `handoff`).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "What the run should do; written to the future agent, which has no other memory of this request than the room's context."},
+                    "at": {"type": "string", "description": "A time: RFC 3339, or local (Europe/Amsterdam) YYYY-MM-DD HH:MM."},
+                    "in": {"type": "string", "description": "A delay from now: 90s, 20m, 1h30m, 2d."},
+                    "every": {"type": "string", "description": "Repeat with this period (at least 1m), e.g. 30m, 1d. First run after one period, or at `at`/`in`."},
+                    "cron": {"type": "string", "description": "Cron with seconds, local time: \"sec min hour day month weekday\", e.g. \"0 0 8 * * Mon-Fri\"."},
+                    "times": {"type": "integer", "description": "How many runs in all (default: 1 for at/in, forever for every/cron)."},
+                    "only_if_new": {"type": "boolean", "description": "Skip a fire (without starting an agent) when nobody wrote in the room, or the schedule's thread, since its last run."},
+                    "thread": {"type": "string", "description": "Omit for this conversation (in another room: its main timeline); \"main\"; or a thread's root event ID."},
+                    "room": room,
+                },
+                "required": ["prompt"]
+            }
+        },
+        {
+            "name": "schedules",
+            "description": "List a room's live schedules, soonest first, with their IDs.",
+            "inputSchema": {"type": "object", "properties": {"room": room}}
+        },
+        {
+            "name": "cancel",
+            "description": "End a schedule: it fires no more. (A run already going is not stopped.)",
+            "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "room": room}, "required": ["id"]}
+        },
+        {
+            "name": "handoff",
+            "description": "Replace a schedule's scratchboard: what its next run is shown first. Use it at the end of a scheduled run to hand over state (what was done, what is next).",
+            "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "room": room}, "required": ["id", "text"]}
         }
     ])
 }
@@ -356,7 +467,9 @@ pub fn handle_rpc(msg: &Value, call: &mut CallFn<'_>) -> Option<Value> {
                 "post" if args.get("body").and_then(Value::as_str).is_none() => {
                     Err("`body` is required".to_owned())
                 }
-                "post" | "read" | "rooms" => call(name, &args),
+                "post" | "read" | "rooms" | "schedule" | "schedules" | "cancel" | "handoff" => {
+                    call(name, &args)
+                }
                 _ => Err(format!("unknown tool {name:?}")),
             };
             let (text, is_error) = match outcome {
@@ -491,7 +604,18 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["post", "read", "rooms"]);
+        assert_eq!(
+            names,
+            [
+                "post",
+                "read",
+                "rooms",
+                "schedule",
+                "schedules",
+                "cancel",
+                "handoff"
+            ]
+        );
         let c = handle_rpc(
             &json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"post","arguments":{"body":"hi","thread":"main"}}}),
             &mut call,
@@ -533,7 +657,11 @@ mod tests {
 
     /// A turn in `!me:x`, thread `$here`, that may read all of `!life:x`
     /// and only read thread `$t` of `!nix:x`.
-    fn turn(got: Arc<Mutex<Vec<Post>>>, reads: Arc<Mutex<Vec<(String, read::Query)>>>) -> Turn {
+    fn turn(
+        got: Arc<Mutex<Vec<Post>>>,
+        reads: Arc<Mutex<Vec<(String, read::Query)>>>,
+        rooms: &Path,
+    ) -> Turn {
         let names = [("life".to_owned(), "!life:x".to_owned())].into();
         let grants = [
             Grant {
@@ -566,6 +694,7 @@ mod tests {
                     })
                 })
             }),
+            schedules: Arc::new(schedule::Store::new(rooms.to_owned())),
         }
     }
 
@@ -578,7 +707,9 @@ mod tests {
 
         let got = Arc::new(Mutex::new(Vec::new()));
         let reads = Arc::new(Mutex::new(Vec::new()));
-        let ticket = posts.register(turn(got.clone(), reads.clone())).unwrap();
+        let ticket = posts
+            .register(turn(got.clone(), reads.clone(), tmp.path()))
+            .unwrap();
         let token = ticket.token.clone();
 
         // The MCP side is blocking; run it off the runtime's threads.
@@ -647,6 +778,35 @@ mod tests {
         );
         let rooms = call("rooms", json!({})).await.unwrap().unwrap();
         assert!(rooms.contains("life !life:x: whole room, read"), "{rooms}");
+
+        // Schedules: made here (in thread $here), listed, handed off, ended.
+        let r = call("schedule", json!({"prompt": "look again", "in": "1h"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(r.starts_with("Scheduled: `"), "{r}");
+        let id = r.split('`').nth(1).unwrap().to_owned();
+        let e = call(
+            "schedule",
+            json!({"prompt": "x", "in": "1h", "room": "life"}),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(e.contains("may not post to !life:x"), "{e}");
+        let list = call("schedules", json!({})).await.unwrap().unwrap();
+        assert!(
+            list.contains(&id) && list.contains("thread $here"),
+            "{list}"
+        );
+        call("handoff", json!({"id": id, "text": "state"}))
+            .await
+            .unwrap()
+            .unwrap();
+        let r = call("cancel", json!({"id": id})).await.unwrap().unwrap();
+        assert!(r.contains("fires no more"), "{r}");
+        let list = call("schedules", json!({})).await.unwrap().unwrap();
+        assert!(list.starts_with("No schedules"), "{list}");
 
         drop(ticket);
         let e = call("post", json!({"body": "late"}))

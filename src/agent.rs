@@ -102,6 +102,17 @@ pub struct Profile {
     /// Other rooms (or parts of them) the `read` and `post` tools may use,
     /// as `[[access]]` tables (see `access.rs`). The room itself is always open.
     pub access: Vec<crate::access::Grant>,
+    /// What starts a run: every message (`message`, the default), or only
+    /// schedules (`schedule`; messages are recorded, and commands work).
+    pub trigger: Trigger,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Trigger {
+    #[default]
+    Message,
+    Schedule,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -131,6 +142,7 @@ impl Default for Profile {
             summaries: None,
             reply: ReplyMode::Text,
             access: Vec::new(),
+            trigger: Trigger::Message,
         }
     }
 }
@@ -635,6 +647,17 @@ impl<H: Harness> Agent<H> {
                 .await
                 .is_ok_and(|p| p.reply == ReplyMode::Tool),
             Err(_) => false,
+        }
+    }
+
+    /// Whether a message starts a run (not in a `trigger = "schedule"`
+    /// room). A missing or broken profile says yes, so its error shows.
+    pub async fn runs_on_messages(&self, room_id: &RoomId) -> bool {
+        match self.room_dir(room_id) {
+            Ok(dir) => Self::profile(&dir)
+                .await
+                .map_or(true, |p| p.trigger == Trigger::Message),
+            Err(_) => true,
         }
     }
 
