@@ -31,15 +31,22 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
   `summaries` put them in Kas's vault as `ai/rooms/<name>/<name> <period>.md`. Set with
   `context` in room.toml or `!context <mode>` in the room (saved in the
   room's `context` file); `!context` alone shows the mode.
-- `src/post.rs`: posting as a tool. With `reply = "tool"` in room.toml the
-  run's final text is not posted; the agent gets an MCP tool `post(body,
-  thread?)` (served by `parley mcp`, which Claude Code starts per run and
-  which forwards to parley over `post.sock` in the data dir, with a
-  per-run token). It may post several times or not at all. A final answer
-  of `[silent]` (no posts) gets a ✓ reaction; any other final text with
-  no posts is posted as a fallback, so errors still show. Posts go only to
-  the run's own room (this thread by default, `thread: "main"` for the
-  main timeline).
+- `src/post.rs`: posting and reading as tools. With `reply = "tool"` in
+  room.toml the run's final text is not posted; the agent gets MCP tools
+  (served by `parley mcp`, which Claude Code starts per run and which
+  forwards to parley over `post.sock` in the data dir, with a per-run
+  token): `post(body, thread?, room?)`, `read(room?, thread?, order?,
+  limit?, cursor?, since?, until?, sender?, contains?)` and `rooms()`.
+  It may post several times or not at all. A final answer of `[silent]`
+  (no posts) gets a ✓ reaction; any other final text with no posts is
+  posted as a fallback, so errors still show.
+- `src/access.rs`: what a turn may read and post to. Its own room always;
+  other rooms, their main timeline, or single threads through
+  `[[access]]` tables in room.toml (`room` = ID or another room's `name`,
+  `thread`, `read`, `write`).
+- `src/read.rs`: the `read` tool's paging and filters. It reads from the
+  Matrix server (`/messages`, or `/relations` for a thread), so it reaches
+  back to a room's first message; a cursor (`<skip>:<token>`) resumes a page.
 - `src/breaker.rs`: the circuit breaker (also used for the Matrix sync loop).
 
 ## State on the lab

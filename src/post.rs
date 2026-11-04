@@ -1,17 +1,19 @@
-//! Posting as a tool: in a room with `reply = "tool"`, the agent's final
-//! text is not posted; the agent posts with an MCP tool `post` instead, as
-//! often as it likes, or not at all.
+//! Posting and reading as tools: in a room with `reply = "tool"`, the
+//! agent's final text is not posted; the agent posts with an MCP tool
+//! `post` instead, as often as it likes, or not at all. It can also `read`
+//! rooms (paginated, filtered) and list the `rooms` open to it; what it may
+//! read and post to is its room's [`Access`].
 //!
 //! Three pieces:
-//! - [`Posts`]: parley's register of running turns that may post. Each
-//!   turn gets a random token; what a post with that token does (send it
-//!   to Matrix, record it) is a closure from `main.rs`.
+//! - [`Posts`]: parley's register of running turns. Each turn gets a random
+//!   token, its access rules, and closures from `main.rs` that send a post
+//!   to Matrix and fetch history from it.
 //! - [`serve`]: a Unix socket in the data dir. One connection carries one
-//!   post: a JSON line `{token, thread, body}` in, `{ok, event_id | error}`
+//!   tool call: a JSON line `{token, tool, args}` in, `{ok, text | error}`
 //!   out.
 //! - [`mcp_main`]: `parley mcp`, the MCP server Claude Code starts for the
-//!   turn (stdio, newline-delimited JSON-RPC). Its `post` tool forwards to
-//!   the socket, with the token from its environment.
+//!   turn (stdio, newline-delimited JSON-RPC). Its tools forward to the
+//!   socket, with the token from its environment.
 
 use std::{
     collections::HashMap,
@@ -30,7 +32,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-/// Where a post goes.
+use crate::{
+    access::{Access, Scope},
+    read,
+};
+
+/// Where in its room a post goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     /// The conversation the turn answers: its thread, or the main timeline.
@@ -57,6 +64,8 @@ impl Target {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Post {
+    /// The room's ID.
+    pub room: String,
     pub target: Target,
     pub body: String,
 }
@@ -64,9 +73,19 @@ pub struct Post {
 type Future_<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// Sends a post; returns the new event's ID.
 pub type SendFn = Arc<dyn Fn(Post) -> Future_<Result<String>> + Send + Sync>;
+/// Reads a page of a room (by ID).
+pub type ReadFn = Arc<dyn Fn(String, read::Query) -> Future_<Result<read::Page>> + Send + Sync>;
+
+/// What a turn's tools do; `main.rs` fills it in.
+#[derive(Clone)]
+pub struct Turn {
+    pub access: Access,
+    pub send: SendFn,
+    pub read: ReadFn,
+}
 
 struct Entry {
-    send: SendFn,
+    turn: Turn,
     count: Arc<AtomicUsize>,
 }
 
@@ -97,13 +116,13 @@ impl Drop for Ticket {
 }
 
 impl Posts {
-    pub fn register(self: &Arc<Self>, send: SendFn) -> Result<Ticket> {
+    pub fn register(self: &Arc<Self>, turn: Turn) -> Result<Ticket> {
         let token = random_token()?;
         let count = Arc::new(AtomicUsize::new(0));
         self.turns.lock().unwrap().insert(
             token.clone(),
             Entry {
-                send,
+                turn,
                 count: count.clone(),
             },
         );
@@ -114,18 +133,54 @@ impl Posts {
         })
     }
 
-    /// Send `post` for the turn holding `token`.
-    pub async fn post(&self, token: &str, post: Post) -> Result<String> {
-        let (send, count) = {
+    /// Run `tool` with `args` for the turn holding `token`; the tool's answer.
+    pub async fn call(&self, token: &str, tool: &str, args: &Value) -> Result<String> {
+        let (turn, count) = {
             let turns = self.turns.lock().unwrap();
             let Some(e) = turns.get(token) else {
-                bail!("this turn is over or unknown; it can no longer post");
+                bail!("this turn is over or unknown; its tools no longer work");
             };
-            (e.send.clone(), e.count.clone())
+            (e.turn.clone(), e.count.clone())
         };
-        let id = send(post).await?;
-        count.fetch_add(1, Ordering::SeqCst);
-        Ok(id)
+        let a = &turn.access;
+        let s = |k: &str| args.get(k).and_then(Value::as_str);
+        match tool {
+            "post" => {
+                let body = s("body").unwrap_or("");
+                if body.trim().is_empty() {
+                    bail!("the body is empty");
+                }
+                let room = a.room(s("room"))?;
+                let target = match Target::parse(s("thread"))? {
+                    // "Here" in another room is its main timeline.
+                    Target::Here if room != a.here => Target::Main,
+                    t => t,
+                };
+                let scope = match &target {
+                    Target::Here => a.here_scope.clone(),
+                    Target::Main => Scope::Main,
+                    Target::Thread(t) => Scope::Thread(t.clone()),
+                };
+                a.check(&room, &scope, true)?;
+                let id = (turn.send)(Post {
+                    room,
+                    target,
+                    body: body.to_owned(),
+                })
+                .await?;
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(format!("Posted ({id})."))
+            }
+            "read" => {
+                let room = a.room(s("room"))?;
+                let q = read::Query::from_args(args, &a.here_scope)?;
+                a.check(&room, &q.scope, false)?;
+                let page = (turn.read)(room.clone(), q.clone()).await?;
+                Ok(read::render(&room, &q, &page))
+            }
+            "rooms" => Ok(a.describe()),
+            _ => bail!("unknown tool {tool:?}"),
+        }
     }
 }
 
@@ -139,11 +194,12 @@ fn random_token() -> Result<String> {
 #[derive(Deserialize)]
 struct Request {
     token: String,
-    thread: Option<String>,
-    body: String,
+    tool: String,
+    #[serde(default)]
+    args: Value,
 }
 
-/// Bind the socket at `path` (replacing a stale one) and answer posts on it
+/// Bind the socket at `path` (replacing a stale one) and answer tool calls on it
 /// until the process ends.
 pub fn listen(path: &Path, posts: Arc<Posts>) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -177,7 +233,7 @@ pub async fn serve(listener: tokio::net::UnixListener, posts: Arc<Posts>) {
                 return;
             }
             let answer = match handle_request(&posts, &line).await {
-                Ok(id) => json!({"ok": true, "event_id": id}),
+                Ok(text) => json!({"ok": true, "text": text}),
                 Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
             };
             let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
@@ -187,19 +243,7 @@ pub async fn serve(listener: tokio::net::UnixListener, posts: Arc<Posts>) {
 
 async fn handle_request(posts: &Posts, line: &str) -> Result<String> {
     let req: Request = serde_json::from_str(line).context("bad request")?;
-    if req.body.trim().is_empty() {
-        bail!("the body is empty");
-    }
-    let target = Target::parse(req.thread.as_deref())?;
-    posts
-        .post(
-            &req.token,
-            Post {
-                target,
-                body: req.body,
-            },
-        )
-        .await
+    posts.call(&req.token, &req.tool, &req.args).await
 }
 
 /// The `--mcp-config` JSON that starts `exe mcp` with the socket and token.
@@ -228,7 +272,16 @@ instead of this thread.\n\n\
 When you have posted what you want to say, end with a final answer of just \
 `[posted]`. If you choose to stay silent, end with just `[silent]`; parley \
 then marks the message with ✓. Any other final answer, when you posted \
-nothing, is posted for you as a fallback.\n";
+nothing, is posted for you as a fallback.\n\n\
+## Reading rooms\n\n\
+The `read` tool reads messages straight from Matrix, including ones from \
+before your context starts: this room by default, or another room that is \
+open to you (`rooms` lists them, with what you may read and post). It \
+returns a page, newest first unless `order: \"oldest\"`, filtered by \
+`thread` (\"here\", \"main\" or a root event ID), `since`/`until` \
+(YYYY-MM-DD or unix seconds), `sender` and `contains`, with a cursor for \
+the next page. Use it when the past matters instead of guessing. `post` \
+takes a `room` too.\n";
 
 /// The final answers that mean "nothing more to post".
 pub fn is_marker(text: &str) -> bool {
@@ -237,31 +290,54 @@ pub fn is_marker(text: &str) -> bool {
 
 // ---- the MCP server (`parley mcp`) ----
 
-const TOOL_DESCRIPTION: &str = "Post a Markdown message to the Matrix room this turn is answering. \
-By default it goes to the conversation the message came from (its thread, or the main timeline). \
-Returns the new event's ID.";
-
 fn tools() -> Value {
-    json!([{
-        "name": "post",
-        "description": TOOL_DESCRIPTION,
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "body": {"type": "string", "description": "The message, in Markdown."},
-                "thread": {"type": "string", "description": "Omit for this conversation; \"main\" for the room's main timeline; or a thread's root event ID."}
-            },
-            "required": ["body"]
+    let room = json!({"type": "string", "description": "Omit for this room; or a room's name or ID from `rooms`."});
+    json!([
+        {
+            "name": "post",
+            "description": "Post a Markdown message to a Matrix room. By default it goes to the conversation this turn answers (its thread, or the main timeline). Returns the new event's ID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "body": {"type": "string", "description": "The message, in Markdown."},
+                    "thread": {"type": "string", "description": "Omit for this conversation (in another room: its main timeline); \"main\" for the main timeline; or a thread's root event ID."},
+                    "room": room,
+                },
+                "required": ["body"]
+            }
+        },
+        {
+            "name": "read",
+            "description": "Read messages of a Matrix room from the server: one page, filtered, with a cursor for the next. Reaches back to the room's first message.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "room": room,
+                    "thread": {"type": "string", "description": "Omit for the whole room; \"here\" for the conversation this turn answers; \"main\" for the main timeline only; or a thread's root event ID."},
+                    "order": {"type": "string", "enum": ["newest", "oldest"], "description": "Walk back from the newest message (default) or forward from the oldest."},
+                    "limit": {"type": "integer", "description": "Messages per page, 1-100 (default 20)."},
+                    "cursor": {"type": "string", "description": "From the previous page, to continue it (keep the other arguments the same)."},
+                    "since": {"type": "string", "description": "Only messages from then on: YYYY-MM-DD, YYYY-MM-DDTHH:MM (UTC) or unix seconds."},
+                    "until": {"type": "string", "description": "Only messages before then (a date includes that whole day)."},
+                    "sender": {"type": "string", "description": "Only senders whose user ID contains this, e.g. \"kas\"."},
+                    "contains": {"type": "string", "description": "Only messages whose text contains this (any case)."}
+                }
+            }
+        },
+        {
+            "name": "rooms",
+            "description": "List the rooms this turn may read and post to, and which parts of them.",
+            "inputSchema": {"type": "object", "properties": {}}
         }
-    }])
+    ])
 }
 
-/// Posts `(thread, body)`; the event ID, or what went wrong.
-pub type PostFn<'a> = dyn FnMut(Option<&str>, &str) -> Result<String, String> + 'a;
+/// Runs tool `name` with `args`; its answer, or what went wrong.
+pub type CallFn<'a> = dyn FnMut(&str, &Value) -> Result<String, String> + 'a;
 
-/// Answer one JSON-RPC message; `None` for notifications. `post` sends
-/// `(thread, body)` on and returns the event ID or an error text.
-pub fn handle_rpc(msg: &Value, post: &mut PostFn<'_>) -> Option<Value> {
+/// Answer one JSON-RPC message; `None` for notifications. Tool calls go
+/// to `call`.
+pub fn handle_rpc(msg: &Value, call: &mut CallFn<'_>) -> Option<Value> {
     let id = msg.get("id")?.clone();
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
@@ -276,15 +352,17 @@ pub fn handle_rpc(msg: &Value, post: &mut PostFn<'_>) -> Option<Value> {
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let outcome = match (name, args.get("body").and_then(Value::as_str)) {
-                ("post", Some(body)) => post(args.get("thread").and_then(Value::as_str), body)
-                    .map(|id| format!("Posted ({id}).")),
-                ("post", None) => Err("`body` is required".to_owned()),
+            let outcome = match name {
+                "post" if args.get("body").and_then(Value::as_str).is_none() => {
+                    Err("`body` is required".to_owned())
+                }
+                "post" | "read" | "rooms" => call(name, &args),
                 _ => Err(format!("unknown tool {name:?}")),
             };
             let (text, is_error) = match outcome {
                 Ok(t) => (t, false),
-                Err(e) => (format!("Not posted: {e}"), true),
+                Err(e) if name == "post" => (format!("Not posted: {e}"), true),
+                Err(e) => (format!("Failed: {e}"), true),
             };
             json!({"content": [{"type": "text", "text": text}], "isError": is_error})
         }
@@ -298,24 +376,19 @@ pub fn handle_rpc(msg: &Value, post: &mut PostFn<'_>) -> Option<Value> {
     Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
 }
 
-/// Send one post to parley's socket.
-fn post_to_socket(
-    socket: &Path,
-    token: &str,
-    thread: Option<&str>,
-    body: &str,
-) -> Result<String, String> {
+/// Send one tool call to parley's socket.
+fn call_socket(socket: &Path, token: &str, tool: &str, args: &Value) -> Result<String, String> {
     let run = || -> Result<String> {
         let mut stream = std::os::unix::net::UnixStream::connect(socket)
             .with_context(|| format!("parley is not listening on {}", socket.display()))?;
-        let req = json!({"token": token, "thread": thread, "body": body});
+        let req = json!({"token": token, "tool": tool, "args": args});
         stream.write_all(format!("{req}\n").as_bytes())?;
         let mut line = String::new();
         BufReader::new(stream).read_line(&mut line)?;
         let answer: Value = serde_json::from_str(&line).context("no answer from parley")?;
         if answer.get("ok") == Some(&Value::Bool(true)) {
             Ok(answer
-                .get("event_id")
+                .get("text")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_owned())
@@ -332,13 +405,13 @@ fn post_to_socket(
     run().map_err(|e| format!("{e:#}"))
 }
 
-/// `parley mcp`: serve the `post` tool on stdin/stdout.
+/// `parley mcp`: serve the tools on stdin/stdout.
 pub fn mcp_main() -> Result<()> {
     let socket: PathBuf = std::env::var_os("PARLEY_SOCKET")
         .context("PARLEY_SOCKET is not set")?
         .into();
     let token = std::env::var("PARLEY_TOKEN").context("PARLEY_TOKEN is not set")?;
-    let mut post = |thread: Option<&str>, body: &str| post_to_socket(&socket, &token, thread, body);
+    let mut call = |tool: &str, args: &Value| call_socket(&socket, &token, tool, args);
     let stdout = std::io::stdout();
     for line in std::io::stdin().lock().lines() {
         let line = line?;
@@ -346,7 +419,7 @@ pub fn mcp_main() -> Result<()> {
             continue;
         }
         let answer = match serde_json::from_str::<Value>(&line) {
-            Ok(msg) => handle_rpc(&msg, &mut post),
+            Ok(msg) => handle_rpc(&msg, &mut call),
             Err(e) => Some(json!({
                 "jsonrpc": "2.0", "id": null,
                 "error": {"code": -32700, "message": e.to_string()},
@@ -364,6 +437,7 @@ pub fn mcp_main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::Grant;
 
     #[test]
     fn targets_parse() {
@@ -389,49 +463,58 @@ mod tests {
     #[test]
     fn rpc_initialize_list_and_call() {
         let mut sent = Vec::new();
-        let mut post = |t: Option<&str>, b: &str| {
-            sent.push((t.map(str::to_owned), b.to_owned()));
-            Ok("$ev".to_owned())
+        let mut call = |t: &str, a: &Value| {
+            sent.push((t.to_owned(), a.clone()));
+            Ok("Posted ($ev).".to_owned())
         };
         let init = handle_rpc(
             &json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}),
-            &mut post,
+            &mut call,
         )
         .unwrap();
         assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
         assert!(
             handle_rpc(
                 &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
-                &mut post
+                &mut call
             )
             .is_none()
         );
         let list = handle_rpc(
             &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
-            &mut post,
+            &mut call,
         )
         .unwrap();
-        assert_eq!(list["result"]["tools"][0]["name"], "post");
-        let call = handle_rpc(
+        let names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["post", "read", "rooms"]);
+        let c = handle_rpc(
             &json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"post","arguments":{"body":"hi","thread":"main"}}}),
-            &mut post,
+            &mut call,
         )
         .unwrap();
-        assert_eq!(call["result"]["isError"], false);
-        assert_eq!(call["result"]["content"][0]["text"], "Posted ($ev).");
+        assert_eq!(c["result"]["isError"], false);
+        assert_eq!(c["result"]["content"][0]["text"], "Posted ($ev).");
         let bad = handle_rpc(
             &json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"post","arguments":{}}}),
-            &mut post,
+            &mut call,
         )
         .unwrap();
         assert_eq!(bad["result"]["isError"], true);
         let unknown = handle_rpc(
             &json!({"jsonrpc":"2.0","id":4,"method":"resources/list"}),
-            &mut post,
+            &mut call,
         )
         .unwrap();
         assert_eq!(unknown["error"]["code"], -32601);
-        assert_eq!(sent, [(Some("main".to_owned()), "hi".to_owned())]);
+        assert_eq!(
+            sent,
+            [("post".to_owned(), json!({"body":"hi","thread":"main"}))]
+        );
     }
 
     #[test]
@@ -448,50 +531,128 @@ mod tests {
         assert_eq!(s["env"]["PARLEY_TOKEN"], "tok");
     }
 
+    /// A turn in `!me:x`, thread `$here`, that may read all of `!life:x`
+    /// and only read thread `$t` of `!nix:x`.
+    fn turn(got: Arc<Mutex<Vec<Post>>>, reads: Arc<Mutex<Vec<(String, read::Query)>>>) -> Turn {
+        let names = [("life".to_owned(), "!life:x".to_owned())].into();
+        let grants = [
+            Grant {
+                room: "life".into(),
+                thread: None,
+                read: true,
+                write: false,
+            },
+            Grant {
+                room: "!nix:x".into(),
+                thread: Some("$t".into()),
+                read: true,
+                write: false,
+            },
+        ];
+        let (access, _) = Access::new("!me:x", Some("parley"), Some("$here"), &grants, &names);
+        Turn {
+            access,
+            send: Arc::new(move |p: Post| {
+                got.lock().unwrap().push(p);
+                Box::pin(async { Ok("$new".to_owned()) })
+            }),
+            read: Arc::new(move |room, q| {
+                reads.lock().unwrap().push((room, q));
+                Box::pin(async {
+                    Ok(read::Page {
+                        msgs: vec![],
+                        next: None,
+                        scanned: 0,
+                    })
+                })
+            }),
+        }
+    }
+
     #[tokio::test]
-    async fn socket_round_trip_counts_posts_and_forgets_dropped_tickets() {
+    async fn socket_round_trip_checks_access_and_forgets_dropped_tickets() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("post.sock");
         let posts = Arc::new(Posts::default());
         listen(&sock, posts.clone()).unwrap();
 
         let got = Arc::new(Mutex::new(Vec::new()));
-        let g = got.clone();
-        let ticket = posts
-            .register(Arc::new(move |p: Post| {
-                g.lock().unwrap().push(p);
-                Box::pin(async { Ok("$new".to_owned()) })
-            }))
-            .unwrap();
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let ticket = posts.register(turn(got.clone(), reads.clone())).unwrap();
         let token = ticket.token.clone();
 
         // The MCP side is blocking; run it off the runtime's threads.
-        let s = sock.clone();
-        let t = token.clone();
-        let r = tokio::task::spawn_blocking(move || post_to_socket(&s, &t, None, "hello"))
+        let call = |tool: &'static str, args: Value| {
+            let (s, t) = (sock.clone(), token.clone());
+            tokio::task::spawn_blocking(move || call_socket(&s, &t, tool, &args))
+        };
+        assert_eq!(
+            call("post", json!({"body": "hello"}))
+                .await
+                .unwrap()
+                .unwrap(),
+            "Posted ($new)."
+        );
+        let e = call("post", json!({"body": "x", "thread": "nope"}))
             .await
-            .unwrap();
-        assert_eq!(r.unwrap(), "$new");
-        let s = sock.clone();
-        let t = token.clone();
-        let r = tokio::task::spawn_blocking(move || post_to_socket(&s, &t, Some("nope"), "x"))
+            .unwrap()
+            .unwrap_err();
+        assert!(e.contains("thread must be"), "{e}");
+        let e = call("post", json!({"body": "x", "room": "life"}))
             .await
-            .unwrap();
-        assert!(r.unwrap_err().contains("thread must be"));
+            .unwrap()
+            .unwrap_err();
+        assert!(e.contains("may not post to !life:x"), "{e}");
         assert_eq!(ticket.count(), 1);
         assert_eq!(
             *got.lock().unwrap(),
             [Post {
+                room: "!me:x".into(),
                 target: Target::Here,
                 body: "hello".into()
             }]
         );
 
-        drop(ticket);
-        let s = sock.clone();
-        let r = tokio::task::spawn_blocking(move || post_to_socket(&s, &token, None, "late"))
+        let r = call("read", json!({"room": "life", "contains": "x"}))
             .await
+            .unwrap()
             .unwrap();
-        assert!(r.unwrap_err().contains("no longer post"));
+        assert!(r.contains("0 message(s) from !life:x"), "{r}");
+        call("read", json!({"room": "!nix:x", "thread": "$t"}))
+            .await
+            .unwrap()
+            .unwrap();
+        let e = call("read", json!({"room": "!nix:x"}))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(e.contains("only: thread $t"), "{e}");
+        call("read", json!({"thread": "here"}))
+            .await
+            .unwrap()
+            .unwrap();
+        let reads: Vec<(String, Scope)> = reads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(r, q)| (r.clone(), q.scope.clone()))
+            .collect();
+        assert_eq!(
+            reads,
+            [
+                ("!life:x".to_owned(), Scope::All),
+                ("!nix:x".to_owned(), Scope::Thread("$t".into())),
+                ("!me:x".to_owned(), Scope::Thread("$here".into())),
+            ]
+        );
+        let rooms = call("rooms", json!({})).await.unwrap().unwrap();
+        assert!(rooms.contains("life !life:x: whole room, read"), "{rooms}");
+
+        drop(ticket);
+        let e = call("post", json!({"body": "late"}))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(e.contains("no longer work"), "{e}");
     }
 }

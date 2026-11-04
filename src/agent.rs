@@ -99,6 +99,9 @@ pub struct Profile {
     /// How the agent speaks: `text` posts the run's final answer; `tool`
     /// gives it a `post` tool instead (see `post.rs`).
     pub reply: ReplyMode,
+    /// Other rooms (or parts of them) the `read` and `post` tools may use,
+    /// as `[[access]]` tables (see `access.rs`). The room itself is always open.
+    pub access: Vec<crate::access::Grant>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -127,6 +130,7 @@ impl Default for Profile {
             name: None,
             summaries: None,
             reply: ReplyMode::Text,
+            access: Vec::new(),
         }
     }
 }
@@ -641,6 +645,36 @@ impl<H: Harness> Agent<H> {
             Ok(dir) => Self::profile(&dir).await.is_ok_and(|p| p.threads),
             Err(_) => false,
         }
+    }
+
+    /// What a turn in `room_id`, answering `thread`, may read and post to,
+    /// and what was wrong with the room's grants. Grants name rooms by ID,
+    /// or by the `name` in their room.toml.
+    pub async fn access(
+        &self,
+        room_id: &RoomId,
+        thread: Option<&str>,
+    ) -> Result<(crate::access::Access, Vec<String>)> {
+        let profile = Self::profile(&self.room_dir(room_id)?).await?;
+        let mut names = HashMap::new();
+        if let Ok(mut entries) = tokio::fs::read_dir(&self.rooms_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let id = entry.file_name().to_string_lossy().into_owned();
+                if !id.starts_with('!') {
+                    continue;
+                }
+                if let Ok(Profile { name: Some(n), .. }) = Self::profile(&entry.path()).await {
+                    names.insert(n, id);
+                }
+            }
+        }
+        Ok(crate::access::Access::new(
+            room_id.as_str(),
+            profile.name.as_deref(),
+            thread,
+            &profile.access,
+            &names,
+        ))
     }
 
     async fn profile(dir: &Path) -> Result<Profile> {

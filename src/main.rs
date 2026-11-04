@@ -28,11 +28,13 @@
 //! and `store/` (encrypted SQLite with the bot's encryption keys). Losing the
 //! store means losing the keys: delete both and log in again as a new device.
 
+mod access;
 mod agent;
 mod breaker;
 mod layered;
 mod memory;
 mod post;
+mod read;
 
 use std::{
     env,
@@ -56,7 +58,7 @@ use matrix_sdk::{
     },
     event_handler::Ctx,
     ruma::{
-        OwnedEventId, OwnedUserId,
+        OwnedEventId, OwnedUserId, RoomId,
         api::{client::uiaa, error::ErrorKind},
         events::key::verification::request::ToDeviceKeyVerificationRequestEvent,
         events::reaction::ReactionEventContent,
@@ -385,6 +387,178 @@ fn post_content(
     Ok((content, thread))
 }
 
+/// The tools of a turn in `room` answering `reply_to` in `here` (a thread
+/// root, or the main timeline): its access rules, posting, and reading.
+async fn tool_turn(
+    client: &Client,
+    agent: &Arc<Agent<ClaudeCode>>,
+    room: &Room,
+    thread_id: Option<&str>,
+    here: &Option<OwnedEventId>,
+    reply_to: &OwnedEventId,
+) -> Result<post::Turn> {
+    let (access, problems) = agent.access(room.room_id(), thread_id).await?;
+    for p in problems {
+        eprintln!("[{}] access: {p}", room.room_id());
+    }
+    let (c, agent, here, reply_to, home) = (
+        client.clone(),
+        agent.clone(),
+        here.clone(),
+        reply_to.clone(),
+        room.room_id().to_owned(),
+    );
+    let send: post::SendFn = Arc::new(move |p: post::Post| {
+        let (c, agent, here, reply_to, home) = (
+            c.clone(),
+            agent.clone(),
+            here.clone(),
+            reply_to.clone(),
+            home.clone(),
+        );
+        Box::pin(async move {
+            let room = joined(&c, &p.room)?;
+            let body = p.body.clone();
+            let (content, thread) = if room.room_id() == home {
+                post_content(p.body, &p.target, here.as_ref(), &reply_to)?
+            } else {
+                // Another room: `Here` was made `Main` already; there is no
+                // message to reply to there.
+                let target = match p.target {
+                    post::Target::Here => post::Target::Main,
+                    t => t,
+                };
+                post_content_elsewhere(p.body, &target)?
+            };
+            let sent = room.send(content).await?;
+            if let Err(e) = agent
+                .record(room.room_id(), thread.as_deref(), "agent", &body)
+                .await
+            {
+                eprintln!("could not write transcript: {e}");
+            }
+            Ok(sent.response.event_id.to_string())
+        })
+    });
+    let c = client.clone();
+    let read: post::ReadFn = Arc::new(move |room_id: String, q: read::Query| {
+        let c = c.clone();
+        Box::pin(async move {
+            let room = joined(&c, &room_id)?;
+            read_page(&room, &q).await
+        })
+    });
+    Ok(post::Turn { access, send, read })
+}
+
+/// The joined room with this ID.
+fn joined(client: &Client, id: &str) -> Result<Room> {
+    let id: &RoomId = id.try_into().context("bad room ID")?;
+    match client.get_room(id) {
+        Some(r) if r.state() == RoomState::Joined => Ok(r),
+        _ => anyhow::bail!("parley is not in room {id}"),
+    }
+}
+
+/// A post to `target` of a room the turn does not answer in.
+fn post_content_elsewhere(
+    body: String,
+    target: &post::Target,
+) -> Result<(RoomMessageEventContent, Option<String>)> {
+    let mut content = RoomMessageEventContent::text_markdown(body);
+    let thread = match target {
+        post::Target::Thread(t) => {
+            let root: OwnedEventId = t.as_str().try_into().context("bad thread ID")?;
+            content.relates_to = Some(Relation::Thread(Thread::plain(root.clone(), root)));
+            Some(t.clone())
+        }
+        _ => None,
+    };
+    Ok((content, thread))
+}
+
+/// One page of `room`'s history for the `read` tool. A thread is read
+/// through its relations (plus its root), the rest through `/messages`.
+async fn read_page(room: &Room, q: &read::Query) -> Result<read::Page> {
+    use matrix_sdk::room::{IncludeRelations, MessagesOptions, RelationsOptions};
+    use matrix_sdk::ruma::{UInt, api::Direction, events::relation::RelationType};
+    let raw = |ev: &matrix_sdk::deserialized_responses::TimelineEvent| {
+        serde_json::from_str::<serde_json::Value>(ev.raw().json().get()).ok()
+    };
+    let dir = if q.oldest_first {
+        Direction::Forward
+    } else {
+        Direction::Backward
+    };
+    let root = match &q.scope {
+        access::Scope::Thread(t) => {
+            Some(OwnedEventId::try_from(t.as_str()).context("bad thread ID")?)
+        }
+        _ => None,
+    };
+    read::collect(q, |token: Option<String>| {
+        let (room, root) = (room.clone(), root.clone());
+        async move {
+            let Some(root) = root else {
+                let mut opts = MessagesOptions::new(dir).from(token.as_deref());
+                opts.limit = UInt::from(100u32);
+                let m = room.messages(opts).await?;
+                let next = if m.chunk.is_empty() { None } else { m.end };
+                return Ok(read::Chunk {
+                    events: m.chunk.iter().filter_map(raw).collect(),
+                    next,
+                });
+            };
+            // A thread: its root comes first walking forward, last walking
+            // back. Tokens: "root", or "rel:<relations token>".
+            let root_chunk = || async {
+                let ev = room.event(&root, None).await?;
+                anyhow::Ok(raw(&ev).into_iter().collect::<Vec<_>>())
+            };
+            match token.as_deref() {
+                None if q.oldest_first => Ok(read::Chunk {
+                    events: root_chunk().await?,
+                    next: Some("rel:".into()),
+                }),
+                Some("root") => Ok(read::Chunk {
+                    events: root_chunk().await?,
+                    next: None,
+                }),
+                t => {
+                    let from = t
+                        .and_then(|t| t.strip_prefix("rel:"))
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_owned);
+                    let rel = room
+                        .relations(
+                            root.clone(),
+                            RelationsOptions {
+                                from,
+                                dir,
+                                limit: Some(UInt::from(100u32)),
+                                include_relations: IncludeRelations::RelationsOfType(
+                                    RelationType::Thread,
+                                ),
+                                recurse: false,
+                            },
+                        )
+                        .await?;
+                    let next = match rel.next_batch_token {
+                        Some(n) => Some(format!("rel:{n}")),
+                        None if !q.oldest_first => Some("root".into()),
+                        None => None,
+                    };
+                    Ok(read::Chunk {
+                        events: rel.chunk.iter().filter_map(raw).collect(),
+                        next,
+                    })
+                }
+            }
+        }
+    })
+    .await
+}
+
 /// Answer every text message from someone else with an agent run.
 async fn on_message(
     ev: OriginalSyncRoomMessageEvent,
@@ -525,35 +699,22 @@ async fn on_message(
                 return;
             }
         };
-        // A `reply = "tool"` room posts with the `post` tool while it runs.
+        // A `reply = "tool"` room posts (and reads) with tools while it runs.
         let ticket = if agent.replies_with_tool(room.room_id()).await {
-            let (room, agent, here, reply_to) = (
-                room.clone(),
-                agent.clone(),
-                thread.clone(),
-                reply_to.clone(),
-            );
-            let send: post::SendFn = Arc::new(move |p: post::Post| {
-                let (room, agent, here, reply_to) =
-                    (room.clone(), agent.clone(), here.clone(), reply_to.clone());
-                Box::pin(async move {
-                    let body = p.body.clone();
-                    let (content, thread) =
-                        post_content(p.body, &p.target, here.as_ref(), &reply_to)?;
-                    let sent = room.send(content).await?;
-                    if let Err(e) = agent
-                        .record(room.room_id(), thread.as_deref(), "agent", &body)
-                        .await
-                    {
-                        eprintln!("could not write transcript: {e}");
-                    }
-                    Ok(sent.response.event_id.to_string())
-                })
-            });
-            match tooling.posts.register(send) {
+            match tool_turn(
+                &client,
+                &agent,
+                &room,
+                thread_id.as_deref(),
+                &thread,
+                &reply_to,
+            )
+            .await
+            .and_then(|turn| tooling.posts.register(turn))
+            {
                 Ok(t) => Some(t),
                 Err(e) => {
-                    eprintln!("could not set up the post tool, answering as text: {e}");
+                    eprintln!("could not set up the tools, answering as text: {e:#}");
                     None
                 }
             }
