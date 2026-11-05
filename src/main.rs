@@ -15,6 +15,10 @@
 //!   PARLEY_DATA_DIR       default <data dir>/parley
 //!   PARLEY_CLAUDE         the claude program, default `claude`
 //!
+//! `parley mcp` serves the tools of one run (PARLEY_SOCKET, PARLEY_TOKEN set
+//! by parley); `parley mcp --client <name>` those of a standing client
+//! (see clients.rs).
+//!
 //! Each room's system prompt is `PARLEY_DATA_DIR/rooms/<room id>/SYSTEM.md`,
 //! written with a default on the room's first message. Edit it any time; the
 //! next message uses the new text.
@@ -31,6 +35,7 @@
 mod access;
 mod agent;
 mod breaker;
+mod clients;
 mod layered;
 mod memory;
 mod post;
@@ -103,10 +108,7 @@ impl Config {
             parse_allowed(&env::var("PARLEY_ALLOWED").unwrap_or_else(|_| {
                 "@kas:chat.lab.artintel.ai,@camille:chat.lab.artintel.ai".into()
             }))?;
-        let data_dir = match env::var_os("PARLEY_DATA_DIR") {
-            Some(d) => d.into(),
-            None => dirs::data_dir().context("no data dir")?.join("parley"),
-        };
+        let data_dir = data_dir()?;
         Ok(Self {
             homeserver: env::var("PARLEY_HOMESERVER")
                 .unwrap_or_else(|_| "https://chat.lab.artintel.ai".into()),
@@ -116,6 +118,14 @@ impl Config {
             claude: env::var("PARLEY_CLAUDE").unwrap_or_else(|_| "claude".into()),
         })
     }
+}
+
+/// `PARLEY_DATA_DIR`, or `<data dir>/parley`.
+fn data_dir() -> Result<PathBuf> {
+    Ok(match env::var_os("PARLEY_DATA_DIR") {
+        Some(d) => d.into(),
+        None => dirs::data_dir().context("no data dir")?.join("parley"),
+    })
 }
 
 /// The user IDs in a comma-separated `PARLEY_ALLOWED` value.
@@ -140,7 +150,23 @@ async fn main() -> Result<()> {
     // `parley mcp`: the `post` tool's MCP server, started by Claude Code for
     // one turn. Its stdout is the protocol, so nothing else may print.
     if env::args().nth(1).as_deref() == Some("mcp") {
-        return post::mcp_main();
+        let (socket, token) = match env::args().nth(2).as_deref() {
+            Some("--client") => {
+                let name = env::args().nth(3).context("--client needs a name")?;
+                let dir = data_dir()?;
+                (
+                    dir.join("post.sock"),
+                    clients::token(&dir.join("clients"), &name)?,
+                )
+            }
+            _ => (
+                env::var_os("PARLEY_SOCKET")
+                    .context("PARLEY_SOCKET is not set")?
+                    .into(),
+                env::var("PARLEY_TOKEN").context("PARLEY_TOKEN is not set")?,
+            ),
+        };
+        return post::mcp_main(socket, token);
     }
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -194,6 +220,18 @@ async fn main() -> Result<()> {
         runs: Runs::default(),
     });
     post::listen(&tooling.socket, tooling.posts.clone())?;
+    // Standing clients (clients.rs): the tools for agents outside our runs.
+    let names = agent.room_names().await;
+    for (name, c) in clients::load(&config.data_dir.join("clients")) {
+        let result = match c {
+            Ok(c) => client_tools(&client, &agent, &tooling, &names, &name, c).await,
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(()) => println!("client {name}: ready"),
+            Err(e) => eprintln!("client {name}: {e:#}"),
+        }
+    }
     client.add_event_handler_context(tooling.clone());
     client.add_event_handler(on_message);
     let allowed = config.allowed.clone();
@@ -484,13 +522,78 @@ async fn tool_turn(
     for p in problems {
         eprintln!("[{}] access: {p}", room.room_id());
     }
-    let (c, agent, here, reply_to, home) = (
-        client.clone(),
-        agent.clone(),
+    let (send, read) = room_tools(
+        client,
+        agent,
+        room.room_id().to_owned(),
         here.clone(),
         reply_to.clone(),
-        room.room_id().to_owned(),
     );
+    Ok(post::Turn {
+        access,
+        send,
+        read,
+        schedules: tooling.schedules.clone(),
+        depth,
+        max_depth,
+    })
+}
+
+/// A standing client's tools: its home room, its grants, no conversation
+/// to answer. They stay registered until parley stops.
+async fn client_tools(
+    client: &Client,
+    agent: &Arc<Agent<ClaudeCode>>,
+    tooling: &Tooling,
+    names: &std::collections::HashMap<String, String>,
+    name: &str,
+    c: clients::Client,
+) -> Result<()> {
+    let home = if c.home.starts_with('!') {
+        c.home.clone()
+    } else {
+        names
+            .get(&c.home)
+            .cloned()
+            .with_context(|| format!("no room is named {:?}", c.home))?
+    };
+    let home_id = OwnedRoomId::try_from(home.as_str()).context("bad home room ID")?;
+    joined(client, &home)?;
+    let home_name = names
+        .iter()
+        .find(|(_, id)| **id == home)
+        .map(|(n, _)| n.as_str());
+    let (access, problems) = access::Access::new(&home, home_name, None, &c.access, names);
+    for p in problems {
+        eprintln!("client {name}: access: {p}");
+    }
+    let max_depth = agent.max_depth(&home_id).await;
+    let (send, read) = room_tools(client, agent, home_id, None, None);
+    tooling.posts.insert(
+        c.token,
+        post::Turn {
+            access,
+            send,
+            read,
+            schedules: tooling.schedules.clone(),
+            depth: 0,
+            max_depth,
+        },
+    );
+    Ok(())
+}
+
+/// Posting and reading for a turn whose own room is `home`, in the
+/// conversation `here` (a thread root, or the main timeline), answering
+/// `reply_to`.
+fn room_tools(
+    client: &Client,
+    agent: &Arc<Agent<ClaudeCode>>,
+    home: OwnedRoomId,
+    here: Option<OwnedEventId>,
+    reply_to: Option<OwnedEventId>,
+) -> (post::SendFn, post::ReadFn) {
+    let (c, agent) = (client.clone(), agent.clone());
     let send: post::SendFn = Arc::new(move |p: post::Post| {
         let (c, agent, here, reply_to, home) = (
             c.clone(),
@@ -531,14 +634,7 @@ async fn tool_turn(
             read_page(&room, &q).await
         })
     });
-    Ok(post::Turn {
-        access,
-        send,
-        read,
-        schedules: tooling.schedules.clone(),
-        depth,
-        max_depth,
-    })
+    (send, read)
 }
 /// The joined room with this ID.
 fn joined(client: &Client, id: &str) -> Result<Room> {

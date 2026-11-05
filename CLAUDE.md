@@ -61,6 +61,12 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
   run a person started, the firing schedule's plus one in a scheduled
   run); `schedule` refuses above room.toml's `max_depth` (default 10).
   At most 20 live schedules per room, fires at least a minute apart.
+- `src/clients.rs`: standing clients, the same tools for agents outside
+  parley's runs (a Claude Code session on the lab, or on the Mac over
+  ssh). One file per client in `clients/<name>.toml` (0600): `home` room,
+  `token`, `[[access]]` grants as in room.toml. Loaded at start; the
+  client runs `parley mcp --client <name>`. Current: `claude-lab`,
+  `claude-mac` (home nixos, read/write on every room).
 - `src/breaker.rs`: the circuit breaker (also used for the Matrix sync loop).
 
 ## State on the lab
@@ -81,6 +87,7 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
     (`ts` unix seconds, `sender`, `thread`, `body`). Not sent to the model.
     Read or grep it to look back at earlier conversations, in this room or
     others.
+- `clients/`: standing clients' files with their tokens (see `src/clients.rs`).
 - `restart`: create this file to ask parley to restart (see below).
 
 Room IDs and names: `journalctl -u parley | grep joined` shows which room is

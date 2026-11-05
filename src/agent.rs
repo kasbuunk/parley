@@ -691,6 +691,18 @@ impl<H: Harness> Agent<H> {
         thread: Option<&str>,
     ) -> Result<(crate::access::Access, Vec<String>)> {
         let profile = Self::profile(&self.room_dir(room_id)?).await?;
+        let names = self.room_names().await;
+        Ok(crate::access::Access::new(
+            room_id.as_str(),
+            profile.name.as_deref(),
+            thread,
+            &profile.access,
+            &names,
+        ))
+    }
+
+    /// Room names (the `name` in each room.toml) to room IDs.
+    pub async fn room_names(&self) -> HashMap<String, String> {
         let mut names = HashMap::new();
         if let Ok(mut entries) = tokio::fs::read_dir(&self.rooms_dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
@@ -703,13 +715,7 @@ impl<H: Harness> Agent<H> {
                 }
             }
         }
-        Ok(crate::access::Access::new(
-            room_id.as_str(),
-            profile.name.as_deref(),
-            thread,
-            &profile.access,
-            &names,
-        ))
+        names
     }
 
     async fn profile(dir: &Path) -> Result<Profile> {

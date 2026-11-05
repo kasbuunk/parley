@@ -140,6 +140,16 @@ impl Posts {
         })
     }
 
+    /// Give a standing client (clients.rs) the tools for as long as parley
+    /// runs, under its own token.
+    pub fn insert(&self, token: String, turn: Turn) {
+        let count = Arc::new(AtomicUsize::new(0));
+        self.turns
+            .lock()
+            .unwrap()
+            .insert(token, Entry { turn, count });
+    }
+
     /// Run `tool` with `args` for the turn holding `token`; the tool's answer.
     pub async fn call(&self, token: &str, tool: &str, args: &Value) -> Result<String> {
         let (turn, count) = {
@@ -533,12 +543,9 @@ fn call_socket(socket: &Path, token: &str, tool: &str, args: &Value) -> Result<S
     run().map_err(|e| format!("{e:#}"))
 }
 
-/// `parley mcp`: serve the tools on stdin/stdout.
-pub fn mcp_main() -> Result<()> {
-    let socket: PathBuf = std::env::var_os("PARLEY_SOCKET")
-        .context("PARLEY_SOCKET is not set")?
-        .into();
-    let token = std::env::var("PARLEY_TOKEN").context("PARLEY_TOKEN is not set")?;
+/// `parley mcp`: serve the tools on stdin/stdout, through the socket at
+/// `socket` with `token`.
+pub fn mcp_main(socket: PathBuf, token: String) -> Result<()> {
     let mut call = |tool: &str, args: &Value| call_socket(&socket, &token, tool, args);
     let stdout = std::io::stdout();
     for line in std::io::stdin().lock().lines() {
