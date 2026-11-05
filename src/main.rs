@@ -81,7 +81,7 @@ use matrix_sdk::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    agent::{Agent, ClaudeCode},
+    agent::{Agent, ClaudeCode, Conv, Said},
     breaker::{Breaker, State},
 };
 
@@ -218,6 +218,7 @@ async fn main() -> Result<()> {
         exe: env::current_exe().context("cannot find parley's own program")?,
         schedules: Arc::new(schedule::Store::new(config.data_dir.join("rooms"))),
         runs: Runs::default(),
+        inbox: Inbox::default(),
     });
     post::listen(&tooling.socket, tooling.posts.clone())?;
     // Standing clients (clients.rs): the tools for agents outside our runs.
@@ -404,6 +405,126 @@ struct Tooling {
     exe: PathBuf,
     schedules: Arc<schedule::Store>,
     runs: Runs,
+    inbox: Inbox,
+}
+
+/// A message, or a schedule's fire, waiting for its conversation's turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Queued {
+    said: Said,
+    /// The message's event; none for a schedule.
+    reply_to: Option<OwnedEventId>,
+    /// The schedule generation of runs it starts (see schedule.rs).
+    depth: u32,
+}
+
+/// Each conversation is an actor: one turn at a time, in order. What comes
+/// in while a turn runs waits here, and the waiting messages are answered
+/// together in the next turn. A conversation is in the map while it is
+/// busy (its queue may be empty).
+#[derive(Default)]
+struct Inbox {
+    convs: Mutex<std::collections::HashMap<Conv, Vec<Queued>>>,
+}
+
+impl Inbox {
+    /// Queue `q`. True when the conversation was idle: the caller then
+    /// runs it (see [`converse`]); otherwise its running turn picks it up.
+    fn push(&self, conv: Conv, q: Queued) -> bool {
+        use std::collections::hash_map::Entry;
+        match self.convs.lock().unwrap().entry(conv) {
+            Entry::Occupied(mut e) => {
+                e.get_mut().push(q);
+                false
+            }
+            Entry::Vacant(e) => {
+                e.insert(vec![q]);
+                true
+            }
+        }
+    }
+
+    /// The next turn's messages: all waiting messages up to a schedule's
+    /// fire, or that fire alone. None (and the conversation idle) when
+    /// nothing waits.
+    fn next(&self, conv: &Conv) -> Option<Vec<Queued>> {
+        let mut convs = self.convs.lock().unwrap();
+        let queue = convs.get_mut(conv)?;
+        if queue.is_empty() {
+            convs.remove(conv);
+            return None;
+        }
+        let n = match queue.iter().position(|q| q.reply_to.is_none()) {
+            Some(0) => 1,
+            Some(i) => i,
+            None => queue.len(),
+        };
+        Some(queue.drain(..n).collect())
+    }
+
+    /// Drop what waits in a conversation; how many there were.
+    fn clear(&self, conv: &Conv) -> usize {
+        self.convs
+            .lock()
+            .unwrap()
+            .get_mut(conv)
+            .map(|q| q.drain(..).count())
+            .unwrap_or(0)
+    }
+}
+
+/// Run `conv`'s turns until nothing waits. A turn stopped by `!!` is
+/// followed by one that says so.
+async fn converse(
+    client: Client,
+    agent: Arc<Agent<ClaudeCode>>,
+    tooling: Arc<Tooling>,
+    room: Room,
+    thread: Option<OwnedEventId>,
+) {
+    let conv: Conv = (
+        room.room_id().to_owned(),
+        thread.as_ref().map(|t| t.as_str().to_owned()),
+    );
+    let mut stopped = false;
+    while let Some(batch) = tooling.inbox.next(&conv) {
+        let reply_to = batch.last().and_then(|q| q.reply_to.clone());
+        let depth = batch.iter().map(|q| q.depth).max().unwrap_or(0);
+        let mut said: Vec<Said> = batch.into_iter().map(|q| q.said).collect();
+        if stopped {
+            said.insert(0, Said::new("parley", STOPPED_NOTE));
+        }
+        let t = tooling.clone();
+        let finished = tooling
+            .runs
+            .track(
+                conv.0.clone(),
+                conv.1.clone(),
+                answer(
+                    client.clone(),
+                    agent.clone(),
+                    t,
+                    room.clone(),
+                    thread.clone(),
+                    reply_to,
+                    said,
+                    depth,
+                ),
+            )
+            .await;
+        stopped = !finished;
+    }
+}
+
+/// Told to the turn after one that `!!` stopped.
+const STOPPED_NOTE: &str = "Your previous turn here was stopped before it \
+finished, because of the message(s) below. What it already did (files, \
+posts) stays; check where it got to before you go on.";
+
+/// `!! <message>`: stop this conversation's turn and answer `<message>`
+/// (with what else waits) right away. The message, or None.
+fn push_message(body: &str) -> Option<&str> {
+    body.trim_start().strip_prefix("!!").map(str::trim)
 }
 
 /// The runs going on (or waiting for their room's turn), so `!stop` can
@@ -419,21 +540,22 @@ struct Runs {
 
 impl Runs {
     /// Run `fut` as the run of `room`'s conversation `thread`, until it ends
-    /// or is stopped.
+    /// or is stopped. False when it was stopped.
     async fn track(
         &self,
         room: OwnedRoomId,
         thread: Option<String>,
         fut: impl Future<Output = ()> + Send + 'static,
-    ) {
+    ) -> bool {
         let task = tokio::spawn(fut);
         let id = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.live
             .lock()
             .unwrap()
             .insert(id, (room, thread, task.abort_handle()));
-        let _ = task.await;
+        let done = task.await;
         self.live.lock().unwrap().remove(&id);
+        !matches!(done, Err(e) if e.is_cancelled())
     }
 
     /// Kill the runs of `room`'s conversation `thread`; how many there were.
@@ -755,7 +877,9 @@ async fn on_message(
         return;
     };
     println!("[{}] {}: {}", room.room_id(), ev.sender, text.body);
-    let body = text.body.clone();
+    // `!!` pushes: the message is recorded and answered without the `!!`.
+    let push = push_message(&text.body).is_some();
+    let body = push_message(&text.body).unwrap_or(&text.body).to_owned();
     // A Matrix thread is its own conversation (own session); the main
     // timeline is another.
     let thread = match &ev.content.relates_to {
@@ -763,7 +887,7 @@ async fn on_message(
         _ => None,
     };
     let reply_to = ev.event_id.clone();
-    let command = Command::parse(&body);
+    let command = (!push).then(|| Command::parse(&body)).flatten();
 
     // Runs take seconds; don't hold up the sync loop meanwhile.
     tokio::spawn(async move {
@@ -808,26 +932,21 @@ async fn on_message(
             Ok(Some(member)) => member.name().to_owned(),
             _ => ev.sender.localpart().to_owned(),
         };
-        let room_id = room.room_id().to_owned();
-        let t = tooling.clone();
-        tooling
-            .runs
-            .track(
-                room_id,
-                thread_id,
-                answer(
-                    client,
-                    agent,
-                    t,
-                    room,
-                    thread,
-                    Some(reply_to),
-                    sender,
-                    body,
-                    0,
-                ),
-            )
-            .await;
+        let conv: Conv = (room.room_id().to_owned(), thread_id.clone());
+        let idle = tooling.inbox.push(
+            conv,
+            Queued {
+                said: Said::new(sender, body),
+                reply_to: Some(reply_to),
+                depth: 0,
+            },
+        );
+        if idle {
+            converse(client, agent, tooling, room, thread).await;
+        } else if push {
+            // The running turn ends; `converse` goes on with this message.
+            tooling.runs.stop(room.room_id(), thread_id.as_deref());
+        }
     });
 }
 
@@ -885,11 +1004,22 @@ async fn run_command(
             Ok(text) => text,
             Err(e) => format!("_{e}_\n\n{}", memory::Mode::HELP),
         },
-        Command::Stop => match tooling.runs.stop(room, thread) {
-            0 => "_Nothing is running here._".to_owned(),
-            1 => "_Stopped the run._".to_owned(),
-            n => format!("_Stopped {n} runs._"),
-        },
+        Command::Stop => {
+            // Drop what waits first, so the stopped run is the last.
+            let waiting = tooling
+                .inbox
+                .clear(&(room.to_owned(), thread.map(str::to_owned)));
+            let dropped = match waiting {
+                0 => String::new(),
+                1 => " and dropped 1 waiting message".to_owned(),
+                n => format!(" and dropped {n} waiting messages"),
+            };
+            match tooling.runs.stop(room, thread) {
+                0 => "_Nothing is running here._".to_owned(),
+                1 => format!("_Stopped the run{dropped}._"),
+                n => format!("_Stopped {n} runs{dropped}._"),
+            }
+        }
         Command::Schedules => match tooling.schedules.list(room.as_str()) {
             Ok(jobs) if jobs.is_empty() => "_No schedules in this room._".to_owned(),
             Ok(jobs) => jobs
@@ -935,8 +1065,7 @@ async fn answer(
     room: Room,
     thread: Option<OwnedEventId>,
     reply_to: Option<OwnedEventId>,
-    sender: String,
-    body: String,
+    said: Vec<Said>,
     depth: u32,
 ) {
     let thread_id = thread.as_ref().map(|t| t.as_str().to_owned());
@@ -981,8 +1110,7 @@ async fn answer(
         .reply_with(
             room.room_id(),
             thread_id.as_deref(),
-            &sender,
-            &body,
+            &said,
             &members,
             mcp_config.as_deref(),
         )
@@ -1002,7 +1130,10 @@ async fn answer(
         }
         Some(_) if post::is_marker(&answer) => {
             if answer.trim().lines().count() > 1 {
-                println!("[{}] silent; final text not posted: {answer}", room.room_id());
+                println!(
+                    "[{}] silent; final text not posted: {answer}",
+                    room.room_id()
+                );
             }
             // Silence, made visible (a schedule's run has nothing to mark).
             if let Some(r) = &reply_to {
@@ -1099,15 +1230,15 @@ async fn fire(
     {
         eprintln!("could not write transcript: {e}");
     }
-    let t = tooling.clone();
-    tooling
-        .runs
-        .track(
-            room.room_id().to_owned(),
-            job.thread.clone(),
-            answer(client, agent, t, room, thread, None, who, body, depth),
-        )
-        .await;
+    let conv: Conv = (room.room_id().to_owned(), job.thread.clone());
+    let fire = Queued {
+        said: Said::new(who, body),
+        reply_to: None,
+        depth,
+    };
+    if tooling.inbox.push(conv, fire) {
+        converse(client, agent, tooling, room, thread).await;
+    }
 }
 
 /// Accept a verification request and drive it through emoji (SAS) comparison.
@@ -1281,6 +1412,55 @@ mod tests {
         assert_eq!((latest(&c), t), (None, None));
     }
 
+    #[test]
+    fn push_strips_the_marks() {
+        assert_eq!(
+            push_message("!! wait, other file"),
+            Some("wait, other file")
+        );
+        assert_eq!(push_message(" !!now"), Some("now"));
+        assert_eq!(push_message("! not"), None);
+        assert_eq!(push_message("hi !!"), None);
+    }
+
+    #[test]
+    fn inbox_answers_waiting_messages_together_and_schedules_alone() {
+        let inbox = Inbox::default();
+        let conv: Conv = ("!r:x".try_into().unwrap(), Some("$t".into()));
+        let other: Conv = ("!r:x".try_into().unwrap(), None);
+        let msg = |b: &str| Queued {
+            said: Said::new("Kas", b),
+            reply_to: Some(format!("${b}").try_into().unwrap()),
+            depth: 0,
+        };
+        let fire = Queued {
+            said: Said::new("schedule s", "go"),
+            reply_to: None,
+            depth: 2,
+        };
+        let bodies = |b: Vec<Queued>| b.into_iter().map(|q| q.said.body).collect::<Vec<_>>();
+
+        // Idle: the first message starts the conversation; others wait.
+        assert!(inbox.push(conv.clone(), msg("a")));
+        assert!(
+            inbox.push(other.clone(), msg("x")),
+            "conversations are separate"
+        );
+        assert_eq!(bodies(inbox.next(&conv).unwrap()), ["a"]);
+        assert!(!inbox.push(conv.clone(), msg("b")));
+        assert!(!inbox.push(conv.clone(), msg("c")));
+        assert!(!inbox.push(conv.clone(), fire.clone()));
+        assert!(!inbox.push(conv.clone(), msg("d")));
+        assert_eq!(bodies(inbox.next(&conv).unwrap()), ["b", "c"]);
+        assert_eq!(bodies(inbox.next(&conv).unwrap()), ["go"]);
+        assert_eq!(bodies(inbox.next(&conv).unwrap()), ["d"]);
+        // Busy until a turn finds nothing: then idle again.
+        assert!(!inbox.push(conv.clone(), msg("e")));
+        assert_eq!(inbox.clear(&conv), 1);
+        assert!(inbox.next(&conv).is_none());
+        assert!(inbox.push(conv.clone(), msg("f")));
+    }
+
     #[tokio::test]
     async fn stop_kills_only_its_conversation() {
         let runs = Arc::new(Runs::default());
@@ -1305,12 +1485,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(runs.stop(&room, Some("$b")), 0);
         assert_eq!(runs.stop(&room, Some("$a")), 1);
-        tokio::time::timeout(Duration::from_secs(1), a)
+        let finished = tokio::time::timeout(Duration::from_secs(1), a)
             .await
             .unwrap()
             .unwrap();
+        assert!(!finished, "a stopped run reports it");
         tx.send(()).unwrap();
-        b.await.unwrap();
+        assert!(b.await.unwrap());
         assert!(runs.live.lock().unwrap().is_empty());
     }
 }

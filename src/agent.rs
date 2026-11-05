@@ -299,11 +299,19 @@ impl Harness for ClaudeCode {
     }
 }
 
+/// A conversation: a room's main timeline (`None`), or one of its threads.
+pub type Conv = (OwnedRoomId, Option<String>);
+
 pub struct Agent<H> {
     harness: H,
     rooms_dir: PathBuf,
     breaker: std::sync::Mutex<Breaker>,
-    /// One lock per room, so replies come out in the order messages came in.
+    /// One lock per conversation (a room's main timeline, or one of its
+    /// threads), so its turns come one after the other; conversations run
+    /// side by side.
+    conv_locks: std::sync::Mutex<HashMap<Conv, Arc<Mutex<()>>>>,
+    /// One lock per room, for what the room's conversations share: its
+    /// context mode and its memory notes.
     room_locks: std::sync::Mutex<HashMap<OwnedRoomId, Arc<Mutex<()>>>>,
     /// Per room, the last exchange a `digest` room still has to take into
     /// its memory (see [`Agent::reflect`]).
@@ -313,7 +321,24 @@ pub struct Agent<H> {
     summarising: std::sync::Mutex<std::collections::HashSet<OwnedRoomId>>,
 }
 
-/// One message and its answer.
+/// A message a turn answers: several when they came in while the
+/// conversation's previous turn ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Said {
+    pub sender: String,
+    pub body: String,
+}
+
+impl Said {
+    pub fn new(sender: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            sender: sender.into(),
+            body: body.into(),
+        }
+    }
+}
+
+/// One message (or several) and its answer.
 struct Exchange {
     sender: String,
     body: String,
@@ -334,6 +359,7 @@ impl<H: Harness> Agent<H> {
             harness,
             rooms_dir,
             breaker: std::sync::Mutex::new(Breaker::new(3, Duration::from_secs(300))),
+            conv_locks: Default::default(),
             room_locks: Default::default(),
             pending_digests: Default::default(),
             summarising: Default::default(),
@@ -352,23 +378,28 @@ impl<H: Harness> Agent<H> {
         body: &str,
         members: &[OwnedUserId],
     ) -> String {
-        self.reply_with(room_id, thread, sender, body, members, None)
+        self.reply_with(room_id, thread, &[Said::new(sender, body)], members, None)
             .await
     }
 
-    /// [`Agent::reply`], giving the run the extra MCP servers in
-    /// `mcp_config`; with one, the system prompt tells the agent to post
-    /// with the `post` tool.
+    /// [`Agent::reply`] to one or more messages, giving the run the extra
+    /// MCP servers in `mcp_config`; with one, the system prompt tells the
+    /// agent to post with the `post` tool.
     pub async fn reply_with(
         &self,
         room_id: &RoomId,
         thread: Option<&str>,
-        sender: &str,
-        body: &str,
+        said: &[Said],
         members: &[OwnedUserId],
         mcp_config: Option<&str>,
     ) -> String {
-        let lock = self.room_lock(room_id);
+        let lock = self
+            .conv_locks
+            .lock()
+            .unwrap()
+            .entry((room_id.to_owned(), thread.map(str::to_owned)))
+            .or_default()
+            .clone();
         let _turn = lock.lock().await;
 
         if let State::Open(left) = self.breaker.lock().unwrap().state() {
@@ -378,10 +409,7 @@ impl<H: Harness> Agent<H> {
             );
         }
 
-        match self
-            .run(room_id, thread, sender, body, members, mcp_config)
-            .await
-        {
+        match self.run(room_id, thread, said, members, mcp_config).await {
             Ok(text) => {
                 self.breaker.lock().unwrap().success();
                 text
@@ -519,7 +547,7 @@ impl<H: Harness> Agent<H> {
         let transcript = tokio::fs::read_to_string(dir.join("transcript.jsonl"))
             .await
             .unwrap_or_default();
-        let msgs = layered::parse(&transcript, "");
+        let msgs = layered::parse(&transcript, &[]);
         let today = layered::day_of(now());
         let (out_dir, prefix) = summaries_of(&dir, &profile);
         let name = profile.name.as_deref().unwrap_or(room_id.as_str());
@@ -752,8 +780,7 @@ impl<H: Harness> Agent<H> {
         &self,
         room_id: &RoomId,
         thread: Option<&str>,
-        sender: &str,
-        body: &str,
+        said: &[Said],
         members: &[OwnedUserId],
         mcp_config: Option<&str>,
     ) -> Result<String> {
@@ -800,14 +827,19 @@ impl<H: Harness> Agent<H> {
         };
         let session = saved.as_ref().map(|s| s.id.clone());
 
-        let message = format!("[{sender}] {body}");
+        let message = said
+            .iter()
+            .map(|s| format!("[{}] {}", s.sender, s.body))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let bodies: Vec<&str> = said.iter().map(|s| s.body.as_str()).collect();
         let input = match mode {
-            Mode::Session | Mode::Fresh => message,
+            Mode::Session | Mode::Fresh => message.clone(),
             Mode::Window(n) | Mode::Digest(n) => {
                 let transcript = tokio::fs::read_to_string(dir.join("transcript.jsonl"))
                     .await
                     .unwrap_or_default();
-                let history = memory::window(&transcript, n, body);
+                let history = memory::window(&transcript, n, &bodies);
                 let notes = match mode {
                     Mode::Digest(_) => tokio::fs::read_to_string(dir.join("MEMORY.md")).await.ok(),
                     _ => None,
@@ -817,7 +849,7 @@ impl<H: Harness> Agent<H> {
             Mode::Layered(n) => {
                 let path = dir.join("transcript.jsonl");
                 let transcript = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-                let msgs = layered::parse(&transcript, body);
+                let msgs = layered::parse(&transcript, &bodies);
                 let (sum_dir, prefix) = summaries_of(&dir, &profile);
                 let have = read_summaries(&sum_dir, &prefix).await;
                 layered::input(
@@ -847,8 +879,11 @@ impl<H: Harness> Agent<H> {
                     self.pending_digests.lock().unwrap().insert(
                         room_id.to_owned(),
                         Exchange {
-                            sender: sender.to_owned(),
-                            body: body.to_owned(),
+                            sender: said.last().map(|s| s.sender.clone()).unwrap_or_default(),
+                            body: match said {
+                                [one] => one.body.clone(),
+                                _ => message.clone(),
+                            },
                             answer: out.text.clone(),
                         },
                     );
@@ -1271,6 +1306,43 @@ echo '{{"result":"ok"}}'"#,
     }
 
     #[tokio::test]
+    async fn messages_answered_together_are_one_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = Agent::new(Fake::default(), tmp.path().to_owned());
+        let said = [Said::new("Kas", "one"), Said::new("Camille", "two")];
+        agent
+            .reply_with(&room("!a:example.org"), None, &said, &[], None)
+            .await;
+        assert_eq!(agent.harness.calls()[0].input, "[Kas] one\n\n[Camille] two");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn threads_of_one_room_run_concurrently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = Arc::new(Agent::new(
+            Fake {
+                sleepy: true,
+                ..Default::default()
+            },
+            tmp.path().to_owned(),
+        ));
+        let r = room("!a:example.org");
+        let a = {
+            let (agent, r) = (agent.clone(), r.clone());
+            tokio::spawn(async move { agent.reply(&r, Some("$a"), "Kas", "150", &[]).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let b = {
+            let (agent, r) = (agent.clone(), r.clone());
+            tokio::spawn(async move { agent.reply(&r, Some("$b"), "Kas", "10", &[]).await })
+        };
+        a.await.unwrap();
+        b.await.unwrap();
+        let log = agent.harness.log.lock().unwrap().clone();
+        assert_eq!(log, ["start 150", "start 10", "end 10", "end 150"]);
+    }
+
+    #[tokio::test]
     async fn harness_error_becomes_error_reply() {
         let tmp = tempfile::tempdir().unwrap();
         let agent = Agent::new(Fake::failing(1), tmp.path().to_owned());
@@ -1332,7 +1404,7 @@ echo '{{"result":"ok"}}'"#,
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn replies_in_one_room_are_serialized_in_arrival_order() {
+    async fn replies_in_one_conversation_are_serialized_in_arrival_order() {
         let tmp = tempfile::tempdir().unwrap();
         let agent = Arc::new(Agent::new(
             Fake {

@@ -17,9 +17,15 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
   A message in a Matrix thread is answered in that thread. `!new` clears the
   session of the main timeline or thread it is sent in. With `threads = true`
   in room.toml, a main-timeline message is answered in a new thread on it.
+  Conversations are actors: the main timeline and each thread take one
+  turn at a time, side by side. Messages that come in during a turn wait
+  (`Inbox`) and are answered together in the next one; a schedule's fire
+  gets a turn of its own. `!! <message>` stops the running turn and
+  answers at once (the next turn is told it was stopped); `!stop` stops
+  it and drops what waits.
 - `src/agent.rs`: one agent turn. Reads the room's folder, builds a `Run`,
   calls the `Harness`. `ClaudeCode` is the only harness: headless
-  `claude -p … --output-format json`. Per-room lock keeps replies in order;
+  `claude -p … --output-format json`. Per-conversation lock keeps turns in order;
   a circuit breaker pauses runs after 3 failures in a row.
 - `src/memory.rs`: context modes, what a turn remembers of earlier ones:
   `session` (resume one Claude session), `fresh`, `window N` (quote the

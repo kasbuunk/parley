@@ -58,20 +58,15 @@ impl Msg {
 }
 
 /// The transcript's messages, oldest first, without commands like `!new`
-/// and without the message being answered (the last line, when it is
-/// `current` from someone other than the agent).
-pub fn parse(transcript: &str, current: &str) -> Vec<Msg> {
+/// and without the messages being answered (`current`, see
+/// [`memory::drop_current`]).
+pub fn parse(transcript: &str, current: &[&str]) -> Vec<Msg> {
     let mut msgs: Vec<Msg> = transcript
         .lines()
         .filter_map(|l| serde_json::from_str::<Msg>(l).ok())
         .filter(|m| !m.body.trim_start().starts_with('!'))
         .collect();
-    if msgs
-        .last()
-        .is_some_and(|m| m.sender != "agent" && m.body == current)
-    {
-        msgs.pop();
-    }
+    memory::drop_current(&mut msgs, current, |m| (&m.sender, &m.body));
     msgs
 }
 
@@ -455,10 +450,10 @@ mod tests {
             r#"{"ts":3,"sender":"@kas:x","thread":"$t","body":"now"}"#,
         ]
         .join("\n");
-        let m = parse(&t, "now");
+        let m = parse(&t, &["now"]);
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].body, "hi");
-        assert_eq!(parse(&t, "other").len(), 2);
+        assert_eq!(parse(&t, &["other"]).len(), 2);
     }
 
     #[test]

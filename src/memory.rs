@@ -111,22 +111,36 @@ struct Line {
     body: String,
 }
 
+/// Take the messages being answered (`current`, recorded before the run)
+/// out of `msgs`: for each, its latest copy from someone other than the
+/// agent. Several when messages that came in during a run are answered
+/// together; others (in other threads) may have come in between.
+pub fn drop_current<T>(
+    msgs: &mut Vec<T>,
+    current: &[&str],
+    sender_body: impl Fn(&T) -> (&str, &str),
+) {
+    for c in current.iter().rev() {
+        if let Some(i) = msgs.iter().rposition(|m| {
+            let (sender, body) = sender_body(m);
+            sender != "agent" && body == *c
+        }) {
+            msgs.remove(i);
+        }
+    }
+}
+
 /// The last `n` messages of a transcript, oldest first, as `[sender] body`
-/// lines, leaving out the message being answered (the transcript's last
-/// line, when it is `current`). Empty if there are none.
-pub fn window(transcript: &str, n: usize, current: &str) -> String {
+/// lines, leaving out the messages being answered (`current`). Empty if
+/// there are none.
+pub fn window(transcript: &str, n: usize, current: &[&str]) -> String {
     let mut lines: Vec<Line> = transcript
         .lines()
         .filter_map(|l| serde_json::from_str::<Line>(l).ok())
         // Commands like `!context` are not part of the conversation.
         .filter(|l| !l.body.trim_start().starts_with('!'))
         .collect();
-    if lines
-        .last()
-        .is_some_and(|l| l.sender != "agent" && l.body == current)
-    {
-        lines.pop();
-    }
+    drop_current(&mut lines, current, |l| (&l.sender, &l.body));
     let start = lines.len().saturating_sub(n);
     let mut out: Vec<String> = lines[start..]
         .iter()
@@ -259,16 +273,27 @@ mod tests {
             ("agent", "four"),
             ("@kas:x", "now"),
         ]);
-        assert_eq!(window(&t, 2, "now"), "[kas] three\n\n[agent] four");
-        assert_eq!(window(&t, 0, "now"), "");
-        // The last line is only skipped when it is the message being answered.
-        assert_eq!(window(&t, 1, "other"), "[kas] now");
+        assert_eq!(window(&t, 2, &["now"]), "[kas] three\n\n[agent] four");
+        assert_eq!(window(&t, 0, &["now"]), "");
+        // A line is only skipped when it is a message being answered.
+        assert_eq!(window(&t, 1, &["other"]), "[kas] now");
+        // Several, with another thread's message in between.
+        let t = transcript(&[
+            ("@kas:x", "one"),
+            ("@kas:x", "a"),
+            ("@ronald:x", "elsewhere"),
+            ("@kas:x", "b"),
+        ]);
+        assert_eq!(
+            window(&t, 5, &["a", "b"]),
+            "[kas] one\n\n[ronald] elsewhere"
+        );
         let t = transcript(&[
             ("@kas:x", "hi"),
             ("@kas:x", "!context window 5"),
             ("@kas:x", "q"),
         ]);
-        assert_eq!(window(&t, 5, "q"), "[kas] hi");
+        assert_eq!(window(&t, 5, &["q"]), "[kas] hi");
     }
 
     #[test]
@@ -278,7 +303,7 @@ mod tests {
             "not json\n{}",
             transcript(&[("@kas:x", &long), ("agent", "ok")])
         );
-        let w = window(&t, 10, "q");
+        let w = window(&t, 10, &["q"]);
         assert!(w.starts_with("[kas] xxx"), "{w}");
         assert!(w.contains(" […]\n\n[agent] ok"), "{w}");
     }
@@ -289,7 +314,7 @@ mod tests {
         let many: Vec<(&str, &str)> = (0..40).map(|_| ("agent", big.as_str())).collect();
         let mut t = transcript(&many);
         t.push_str(&transcript(&[("agent", "last")]));
-        let w = window(&t, 100, "q");
+        let w = window(&t, 100, &["q"]);
         assert!(w.len() <= MAX_HISTORY_CHARS + 100, "{}", w.len());
         assert!(w.ends_with("[agent] last"));
     }
