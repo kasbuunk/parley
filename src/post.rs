@@ -365,8 +365,10 @@ needs saying. Pass `thread: \"main\"` to post in the room's main timeline \
 instead of this thread.\n\n\
 When you have posted what you want to say, end with a final answer of just \
 `[posted]`. If you choose to stay silent, end with just `[silent]`; parley \
-then marks the message with ✓. Any other final answer, when you posted \
-nothing, is posted for you as a fallback.\n\n\
+then marks the message with ✓. A final answer whose last line is one of \
+these markers is never posted, so anything you write above the marker is \
+lost: put what Kas should see in `post`. Any other final answer, when you \
+posted nothing, is posted for you as a fallback.\n\n\
 ## Reading rooms\n\n\
 The `read` tool reads messages straight from Matrix, including ones from \
 before your context starts: this room by default, or another room that is \
@@ -385,9 +387,12 @@ fire when nobody wrote since the last run. `schedules` lists them, \
 needs, and schedule it: state lives on, the process does not. A message \
 starting with `[schedule <id>: …]` was sent by a schedule, not a person.\n";
 
-/// The final answers that mean "nothing more to post".
+/// The final answers that mean "nothing more to post": empty, or a
+/// `[posted]` / `[silent]` marker as the last line. Models often write a
+/// report and then the marker; the marker is what they meant.
 pub fn is_marker(text: &str) -> bool {
-    matches!(text.trim(), "" | "[posted]" | "[silent]")
+    let last = text.trim().lines().last().unwrap_or("").trim();
+    matches!(last, "" | "[posted]" | "[silent]")
 }
 
 // ---- the MCP server (`parley mcp`) ----
@@ -593,6 +598,10 @@ mod tests {
         assert!(is_marker("[posted]"));
         assert!(is_marker(""));
         assert!(!is_marker("Here is the answer"));
+        assert!(is_marker("All fine, nothing posted.\n\n[silent]\n"));
+        assert!(is_marker("Report.\n[posted]"));
+        assert!(!is_marker("[silent] is what I would say, but here is more"));
+        assert!(!is_marker("Use `[silent]` to stay quiet"));
     }
 
     #[test]

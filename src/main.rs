@@ -1001,6 +1001,9 @@ async fn answer(
             }
         }
         Some(_) if post::is_marker(&answer) => {
+            if answer.trim().lines().count() > 1 {
+                println!("[{}] silent; final text not posted: {answer}", room.room_id());
+            }
             // Silence, made visible (a schedule's run has nothing to mark).
             if let Some(r) = &reply_to {
                 let mark = ReactionEventContent::new(Annotation::new(r.clone(), "✓".into()));
