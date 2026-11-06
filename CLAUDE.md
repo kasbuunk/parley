@@ -66,7 +66,10 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
   as the handoff scratchboard shown to the next run. `only_if_new` skips
   a fire, without an agent, when no person wrote since the last run. A
   scheduler loop in `main.rs` fires them through the same path as a
-  message. `trigger = "schedule"` in room.toml: messages start no run.
+  message. `trigger = "schedule"` in room.toml: messages start no run;
+  `trigger = "mention"` with `names = ["melchior"]`: only a message that
+  mentions the bot (Matrix pill or a name as a word) or follows up in a
+  thread it spoke in starts one; the rest is only recorded.
   Loop guard: each schedule has a generation (`depth`: 0 when made in a
   run a person started, the firing schedule's plus one in a scheduled
   run); `schedule` refuses above room.toml's `max_depth` (default 10).

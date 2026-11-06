@@ -862,7 +862,8 @@ async fn read_page(room: &Room, q: &read::Query) -> Result<read::Page> {
 }
 
 /// Answer every text message from someone else with an agent run (or, in
-/// a `trigger = "schedule"` room, only record it).
+/// a `trigger = "schedule"` room, only record it; in a `mention` room, only
+/// answer the ones that call the bot).
 async fn on_message(
     ev: OriginalSyncRoomMessageEvent,
     room: Room,
@@ -901,12 +902,30 @@ async fn on_message(
     let reply_to = ev.event_id.clone();
     let command = (!push).then(|| Command::parse(&body)).flatten();
 
+    // A Matrix mention of the bot (Element's pill), for `trigger = "mention"`.
+    let mentioned = ev
+        .content
+        .mentions
+        .as_ref()
+        .zip(client.user_id())
+        .is_some_and(|(m, me)| m.user_ids.contains(me));
+
     // Runs take seconds; don't hold up the sync loop meanwhile.
     tokio::spawn(async move {
+        let wakes = command.is_none()
+            && agent
+                .wakes(
+                    room.room_id(),
+                    thread.as_ref().map(|t| t.as_str()),
+                    &body,
+                    mentioned,
+                )
+                .await;
         // A room with `threads` answers a main-timeline message in a new
-        // thread rooted at that message (but commands stay where they are).
+        // thread rooted at that message (but commands, and messages that
+        // start no run, stay where they are).
         let thread = match thread {
-            None if command.is_none() && agent.starts_threads(room.room_id()).await => {
+            None if wakes && agent.starts_threads(room.room_id()).await => {
                 Some(reply_to.clone())
             }
             t => t,
@@ -936,7 +955,7 @@ async fn on_message(
             send_text(&room, text, thread.as_ref(), Some(&reply_to)).await;
             return;
         }
-        if !agent.runs_on_messages(room.room_id()).await {
+        if !wakes {
             return;
         }
 

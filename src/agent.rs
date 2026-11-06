@@ -102,9 +102,15 @@ pub struct Profile {
     /// Other rooms (or parts of them) the `read` and `post` tools may use,
     /// as `[[access]]` tables (see `access.rs`). The room itself is always open.
     pub access: Vec<crate::access::Grant>,
-    /// What starts a run: every message (`message`, the default), or only
-    /// schedules (`schedule`; messages are recorded, and commands work).
+    /// What starts a run: every message (`message`, the default), only
+    /// schedules (`schedule`; messages are recorded, and commands work), or
+    /// only a message that mentions the bot (`mention`: a Matrix mention of
+    /// it, one of `names` as a word, or any message in a thread it already
+    /// spoke in). Schedules start runs in every mode.
     pub trigger: Trigger,
+    /// Names the bot answers to in a `trigger = "mention"` room, matched as
+    /// whole words in any case, e.g. `["melchior"]`.
+    pub names: Vec<String>,
     /// How many generations of schedules may make schedules (see
     /// `schedule::Job::depth`). Default 10.
     pub max_depth: u32,
@@ -116,6 +122,7 @@ pub enum Trigger {
     #[default]
     Message,
     Schedule,
+    Mention,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -124,6 +131,27 @@ pub enum ReplyMode {
     #[default]
     Text,
     Tool,
+}
+
+/// Whether `body` holds one of `names` as a whole word, in any case.
+fn names_in(body: &str, names: &[String]) -> bool {
+    let words: Vec<String> = body
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    names.iter().any(|n| words.contains(&n.to_lowercase()))
+}
+
+/// Whether the bot (`sender` "agent") has a line in `thread` of the
+/// transcript at `path`.
+async fn spoke_in(path: &Path, thread: &str) -> bool {
+    let Ok(text) = tokio::fs::read_to_string(path).await else {
+        return false;
+    };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .any(|v| v["sender"] == "agent" && v["thread"] == thread)
 }
 
 impl Default for Profile {
@@ -146,6 +174,7 @@ impl Default for Profile {
             reply: ReplyMode::Text,
             access: Vec::new(),
             trigger: Trigger::Message,
+            names: Vec::new(),
             max_depth: 10,
         }
     }
@@ -690,14 +719,35 @@ impl<H: Harness> Agent<H> {
         }
     }
 
-    /// Whether a message starts a run (not in a `trigger = "schedule"`
-    /// room). A missing or broken profile says yes, so its error shows.
-    pub async fn runs_on_messages(&self, room_id: &RoomId) -> bool {
-        match self.room_dir(room_id) {
-            Ok(dir) => Self::profile(&dir)
-                .await
-                .map_or(true, |p| p.trigger == Trigger::Message),
-            Err(_) => true,
+    /// Whether a message starts a run: always with `trigger = "message"`,
+    /// never with `schedule`, and with `mention` only when `mentioned` (a
+    /// Matrix mention of the bot), when the body names the bot (`names`),
+    /// or when `thread` is one the bot already spoke in. A missing or
+    /// broken profile says yes, so its error shows.
+    pub async fn wakes(
+        &self,
+        room_id: &RoomId,
+        thread: Option<&str>,
+        body: &str,
+        mentioned: bool,
+    ) -> bool {
+        let Ok(dir) = self.room_dir(room_id) else {
+            return true;
+        };
+        let Ok(profile) = Self::profile(&dir).await else {
+            return true;
+        };
+        match profile.trigger {
+            Trigger::Message => true,
+            Trigger::Schedule => false,
+            Trigger::Mention => {
+                mentioned
+                    || names_in(body, &profile.names)
+                    || match thread {
+                        Some(t) => spoke_in(&dir.join("transcript.jsonl"), t).await,
+                        None => false,
+                    }
+            }
         }
     }
 
@@ -1479,6 +1529,36 @@ echo '{{"result":"ok"}}'"#,
         let dir = rooms.join(id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("room.toml"), "resume = true\n").unwrap();
+    }
+
+    #[tokio::test]
+    async fn mention_rooms_wake_on_a_name_a_mention_or_their_own_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = Agent::new(Fake::default(), tmp.path().to_owned());
+        let r = room("!m:example.org");
+        let dir = tmp.path().join("!m:example.org");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("room.toml"),
+            "trigger = \"mention\"\nnames = [\"Melchior\"]\n",
+        )
+        .unwrap();
+        assert!(!agent.wakes(&r, None, "we moeten Lampje kopen", false).await);
+        assert!(agent.wakes(&r, None, "melchior, wat denk jij?", false).await);
+        assert!(agent.wakes(&r, None, "Vraag het @Melchior.", false).await);
+        assert!(!agent.wakes(&r, None, "Melchiors boek", false).await);
+        assert!(agent.wakes(&r, None, "agent: hoi", true).await);
+        assert!(!agent.wakes(&r, Some("$t"), "en nu?", false).await);
+        agent.record(&r, Some("$t"), "agent", "hier").await.unwrap();
+        assert!(agent.wakes(&r, Some("$t"), "en nu?", false).await);
+        assert!(!agent.wakes(&r, Some("$u"), "en nu?", false).await);
+
+        let s = room("!s:example.org");
+        let dir = tmp.path().join("!s:example.org");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("room.toml"), "trigger = \"schedule\"\n").unwrap();
+        assert!(!agent.wakes(&s, None, "melchior", true).await);
+        assert!(agent.wakes(&room("!none:example.org"), None, "x", false).await);
     }
 
     #[tokio::test]
