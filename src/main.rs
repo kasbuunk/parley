@@ -15,6 +15,8 @@
 //!   PARLEY_DATA_DIR       default <data dir>/parley
 //!   PARLEY_CLAUDE         the claude program, default `claude`
 //!
+//! `parley say` posts one message as another account and exits (say.rs).
+//!
 //! `parley mcp` serves the tools of one run (PARLEY_SOCKET, PARLEY_TOKEN set
 //! by parley); `parley mcp --client <name>` those of a standing client
 //! (see clients.rs).
@@ -40,6 +42,7 @@ mod layered;
 mod memory;
 mod post;
 mod read;
+mod say;
 mod schedule;
 
 use std::{
@@ -168,6 +171,11 @@ async fn main() -> Result<()> {
         };
         return post::mcp_main(socket, token);
     }
+    // `parley say`: post one message as another account (say.rs).
+    if env::args().nth(1).as_deref() == Some("say") {
+        let args: Vec<String> = env::args().skip(2).collect();
+        return say::main(say::Args::parse(&args)?).await;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -176,23 +184,8 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::from_env()?;
-    std::fs::create_dir_all(&config.data_dir)?;
-    let session_file = config.data_dir.join("session.json");
-    let store_dir = config.data_dir.join("store");
-
-    let client = if session_file.exists() {
-        let saved: SavedSession = serde_json::from_str(&std::fs::read_to_string(&session_file)?)?;
-        let client = Client::builder()
-            .homeserver_url(&saved.homeserver)
-            .sqlite_store(&store_dir, Some(&saved.store_passphrase))
-            .build()
-            .await?;
-        client.restore_session(saved.matrix).await?;
-        println!("restored session for {}", client.user_id().unwrap());
-        client
-    } else {
-        first_login(&config, &session_file, &store_dir).await?
-    };
+    let client = login().await?;
+    println!("restored session for {}", client.user_id().unwrap());
 
     // Catch up once without handlers, so old messages are not answered again.
     let response = client.sync_once(SyncSettings::default()).await?;
@@ -315,6 +308,25 @@ async fn sync_forever(client: &Client, settings: SyncSettings) -> Result<()> {
     Ok(())
 }
 
+/// The account in the data dir: its saved session, or a first login.
+async fn login() -> Result<Client> {
+    let config = Config::from_env()?;
+    std::fs::create_dir_all(&config.data_dir)?;
+    let session_file = config.data_dir.join("session.json");
+    let store_dir = config.data_dir.join("store");
+    if !session_file.exists() {
+        return first_login(&config, &session_file, &store_dir).await;
+    }
+    let saved: SavedSession = serde_json::from_str(&std::fs::read_to_string(&session_file)?)?;
+    let client = Client::builder()
+        .homeserver_url(&saved.homeserver)
+        .sqlite_store(&store_dir, Some(&saved.store_passphrase))
+        .build()
+        .await?;
+    client.restore_session(saved.matrix).await?;
+    Ok(client)
+}
+
 /// Log in with the password once, save the session, and set up cross-signing
 /// so the bot's device is signed by its own identity.
 async fn first_login(
@@ -355,7 +367,7 @@ async fn first_login(
             .context("logged in but no session")?,
     };
     write_private(session_file, &serde_json::to_string_pretty(&saved)?)?;
-    println!(
+    eprintln!(
         "logged in as {user}; session saved to {}",
         session_file.display()
     );
@@ -371,7 +383,7 @@ async fn first_login(
             handle.auth(Some(uiaa::AuthData::Password(auth))).await?;
         }
     }
-    println!("cross-signing identity created");
+    eprintln!("cross-signing identity created");
     Ok(client)
 }
 

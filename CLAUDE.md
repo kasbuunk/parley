@@ -53,6 +53,10 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
 - `src/read.rs`: the `read` tool's paging and filters. It reads from the
   Matrix server (`/messages`, or `/relations` for a thread), so it reaches
   back to a room's first message; a cursor (`<skip>:<token>`) resumes a page.
+- `src/say.rs`: `parley say [--thread <id>] [--notice] <room id>` (body on
+  stdin) posts one message as another account (its own PARLEY_DATA_DIR)
+  and exits. For alarm bots like `@lab-alert`, whose messages parley then
+  answers like any member's; `--notice` posts without starting a run.
 - `src/schedule.rs`: schedules, runs that start without a message. Kinds
   from transmit (`at`/`in` once, `every`, `cron` in local time with
   seconds; `times` or forever). MCP tools `schedule`, `schedules`,
