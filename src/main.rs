@@ -44,6 +44,7 @@ mod post;
 mod read;
 mod say;
 mod schedule;
+mod voice;
 
 use std::{
     env,
@@ -67,6 +68,7 @@ use matrix_sdk::{
         },
     },
     event_handler::Ctx,
+    media::{MediaFormat, MediaRequestParameters},
     ruma::{
         OwnedEventId, OwnedRoomId, OwnedUserId, RoomId,
         api::{client::uiaa, error::ErrorKind},
@@ -76,7 +78,8 @@ use matrix_sdk::{
         events::room::{
             member::StrippedRoomMemberEvent,
             message::{
-                MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
+                AudioMessageEventContent, MessageType, OriginalSyncRoomMessageEvent, Relation,
+                RoomMessageEventContent,
             },
         },
     },
@@ -886,13 +889,11 @@ async fn on_message(
         }
         return;
     }
-    let MessageType::Text(text) = &ev.content.msgtype else {
-        return;
+    let (text, audio) = match &ev.content.msgtype {
+        MessageType::Text(text) => (Some(text.body.clone()), None),
+        MessageType::Audio(audio) => (None, Some(audio.clone())),
+        _ => return,
     };
-    println!("[{}] {}: {}", room.room_id(), ev.sender, text.body);
-    // `!!` pushes: the message is recorded and answered without the `!!`.
-    let push = push_message(&text.body).is_some();
-    let body = push_message(&text.body).unwrap_or(&text.body).to_owned();
     // A Matrix thread is its own conversation (own session); the main
     // timeline is another.
     let thread = match &ev.content.relates_to {
@@ -900,7 +901,6 @@ async fn on_message(
         _ => None,
     };
     let reply_to = ev.event_id.clone();
-    let command = (!push).then(|| Command::parse(&body)).flatten();
 
     // A Matrix mention of the bot (Element's pill), for `trigger = "mention"`.
     let mentioned = ev
@@ -912,6 +912,35 @@ async fn on_message(
 
     // Runs take seconds; don't hold up the sync loop meanwhile.
     tokio::spawn(async move {
+        // A voice message becomes its transcript, then goes the same way.
+        let (body, push, echo) = match (text, audio) {
+            (Some(text), _) => {
+                println!("[{}] {}: {}", room.room_id(), ev.sender, text);
+                // `!!` pushes: the message is recorded and answered without the `!!`.
+                match push_message(&text) {
+                    Some(rest) => (rest.to_owned(), true, false),
+                    None => (text, false, false),
+                }
+            }
+            (None, Some(audio)) => {
+                let mode = agent.voice(room.room_id()).await;
+                if mode == voice::Voice::Off {
+                    return;
+                }
+                println!("[{}] {}: (voice message)", room.room_id(), ev.sender);
+                match hear(&client, &agent, room.room_id(), &ev.event_id, &audio).await {
+                    Ok(text) => (voice::heard(&text), false, mode == voice::Voice::Reply),
+                    Err(e) => {
+                        eprintln!("voice message {}: {e:#}", ev.event_id);
+                        let msg = format!("_Could not transcribe this voice message: {e:#}_");
+                        send_text(&room, msg, thread.as_ref(), Some(&reply_to)).await;
+                        return;
+                    }
+                }
+            }
+            (None, None) => return,
+        };
+        let command = (!push).then(|| Command::parse(&body)).flatten();
         let wakes = command.is_none()
             && agent
                 .wakes(
@@ -925,11 +954,13 @@ async fn on_message(
         // thread rooted at that message (but commands, and messages that
         // start no run, stay where they are).
         let thread = match thread {
-            None if wakes && agent.starts_threads(room.room_id()).await => {
-                Some(reply_to.clone())
-            }
+            None if wakes && agent.starts_threads(room.room_id()).await => Some(reply_to.clone()),
             t => t,
         };
+        if echo {
+            // Show what was heard, where the answer will come.
+            send_text(&room, body.clone(), thread.as_ref(), Some(&reply_to)).await;
+        }
         let thread_id = thread.as_ref().map(|t| t.as_str().to_owned());
         if let Err(e) = agent
             .record(
@@ -979,6 +1010,33 @@ async fn on_message(
             tooling.runs.stop(room.room_id(), thread_id.as_deref());
         }
     });
+}
+
+/// The text of the voice message `event` (`audio`) in `room`: downloaded
+/// (and decrypted) to the room's `media/`, then transcribed.
+async fn hear(
+    client: &Client,
+    agent: &Agent<ClaudeCode>,
+    room: &RoomId,
+    event: &OwnedEventId,
+    audio: &AudioMessageEventContent,
+) -> Result<String> {
+    let request = MediaRequestParameters {
+        source: audio.source.clone(),
+        format: MediaFormat::File,
+    };
+    let bytes = client
+        .media()
+        .get_media_content(&request, false)
+        .await
+        .context("could not download it")?;
+    let mimetype = audio.info.as_ref().and_then(|i| i.mimetype.as_deref());
+    let ext = voice::extension(mimetype, &audio.body);
+    let file = agent.media_file(room, event.as_str(), &ext).await?;
+    tokio::fs::write(&file, &bytes)
+        .await
+        .with_context(|| format!("could not save {}", file.display()))?;
+    voice::transcribe(&voice::transcriber(), &file, voice::TIMEOUT).await
 }
 
 /// A `!` command: handled by parley itself, without an agent.

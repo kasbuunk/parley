@@ -114,6 +114,9 @@ pub struct Profile {
     /// How many generations of schedules may make schedules (see
     /// `schedule::Job::depth`). Default 10.
     pub max_depth: u32,
+    /// What to do with voice messages: `reply` (transcribe and show the
+    /// transcript, the default), `quiet` (transcribe only) or `off`.
+    pub voice: crate::voice::Voice,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -176,6 +179,7 @@ impl Default for Profile {
             trigger: Trigger::Message,
             names: Vec::new(),
             max_depth: 10,
+            voice: crate::voice::Voice::Reply,
         }
     }
 }
@@ -753,6 +757,28 @@ impl<H: Harness> Agent<H> {
 
     /// Whether the room's profile says to answer main-timeline messages in
     /// a new thread. A missing or broken profile says no.
+    /// What `room_id` does with voice messages.
+    pub async fn voice(&self, room_id: &RoomId) -> crate::voice::Voice {
+        match self.room_dir(room_id) {
+            Ok(dir) => Self::profile(&dir)
+                .await
+                .map_or(crate::voice::Voice::Off, |p| p.voice),
+            Err(_) => crate::voice::Voice::Off,
+        }
+    }
+
+    /// Where to keep the media of event `event_id` in `room_id`:
+    /// `media/<event id>.<ext>` in the room's folder (created).
+    pub async fn media_file(&self, room_id: &RoomId, event_id: &str, ext: &str) -> Result<PathBuf> {
+        let name = event_id.trim_start_matches('$');
+        if name.is_empty() || name.contains('/') || name.contains("..") {
+            bail!("refusing event ID {event_id:?}");
+        }
+        let dir = self.room_dir(room_id)?.join("media");
+        tokio::fs::create_dir_all(&dir).await?;
+        Ok(dir.join(format!("{name}.{ext}")))
+    }
+
     pub async fn starts_threads(&self, room_id: &RoomId) -> bool {
         match self.room_dir(room_id) {
             Ok(dir) => Self::profile(&dir).await.is_ok_and(|p| p.threads),
@@ -1544,7 +1570,11 @@ echo '{{"result":"ok"}}'"#,
         )
         .unwrap();
         assert!(!agent.wakes(&r, None, "we moeten Lampje kopen", false).await);
-        assert!(agent.wakes(&r, None, "melchior, wat denk jij?", false).await);
+        assert!(
+            agent
+                .wakes(&r, None, "melchior, wat denk jij?", false)
+                .await
+        );
         assert!(agent.wakes(&r, None, "Vraag het @Melchior.", false).await);
         assert!(!agent.wakes(&r, None, "Melchiors boek", false).await);
         assert!(agent.wakes(&r, None, "agent: hoi", true).await);
@@ -1558,7 +1588,11 @@ echo '{{"result":"ok"}}'"#,
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("room.toml"), "trigger = \"schedule\"\n").unwrap();
         assert!(!agent.wakes(&s, None, "melchior", true).await);
-        assert!(agent.wakes(&room("!none:example.org"), None, "x", false).await);
+        assert!(
+            agent
+                .wakes(&room("!none:example.org"), None, "x", false)
+                .await
+        );
     }
 
     #[tokio::test]

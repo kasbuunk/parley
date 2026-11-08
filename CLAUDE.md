@@ -80,6 +80,14 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
   `token`, `[[access]]` grants as in room.toml. Loaded at start; the
   client runs `parley mcp --client <name>`. Current: `claude-lab`,
   `claude-mac` (home nixos, read/write on every room).
+- `src/voice.rs`: voice messages. An `m.audio` event is downloaded
+  (decrypted by the SDK) to the room's `media/<event id>.<ext>`, run
+  through `parley-transcribe` (`transcribe/parley-transcribe.py`,
+  faster-whisper large-v3-turbo on the CPU, the model room-transcribe
+  uses; built next to `parley` by the flake), and then handled as the
+  text message `🎤 <transcript>`. `voice` in room.toml: `reply` (default:
+  the transcript is also posted as a reply, where the answer will come),
+  `quiet`, or `off`. A 5-second clip takes about 20 s.
 - `src/breaker.rs`: the circuit breaker (also used for the Matrix sync loop).
 
 ## State on the lab
