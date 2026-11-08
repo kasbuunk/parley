@@ -34,7 +34,7 @@
         {
           inherit parley transcribe;
           default =
-            if pkgs.stdenv.isLinux then
+            if pkgs.stdenv.hostPlatform.isLinux then
               pkgs.symlinkJoin {
                 name = "parley-0.1.0";
                 paths = [

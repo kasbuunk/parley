@@ -32,15 +32,18 @@ pub enum Voice {
 pub const TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The transcriber to run: `PARLEY_TRANSCRIBE`, or `parley-transcribe`
-/// next to this executable, or on PATH.
+/// next to this executable (as started: the flake's `bin/` holds symlinks
+/// into two packages, so the resolved path would miss it), or on PATH.
 pub fn transcriber() -> PathBuf {
     if let Some(p) = std::env::var_os("PARLEY_TRANSCRIBE") {
         return PathBuf::from(p);
     }
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|d| d.join("parley-transcribe")))
-        .filter(|p| p.exists())
+    let started = std::env::args_os().next().map(PathBuf::from);
+    [started, std::env::current_exe().ok()]
+        .into_iter()
+        .flatten()
+        .filter_map(|exe| exe.parent().map(|d| d.join("parley-transcribe")))
+        .find(|p| p.is_absolute() && p.exists())
         .unwrap_or_else(|| PathBuf::from("parley-transcribe"))
 }
 
