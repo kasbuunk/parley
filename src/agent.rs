@@ -117,6 +117,11 @@ pub struct Profile {
     /// What to do with voice messages: `reply` (transcribe and show the
     /// transcript, the default), `quiet` (transcribe only) or `off`.
     pub voice: crate::voice::Voice,
+    /// Extra MCP servers for this room: Claude Code `--mcp-config` files,
+    /// loaded even with `mcp = false`. With `tools = ""` they are a room's
+    /// whole capability set, e.g. a context engine limited to the room's
+    /// readers and a few house controls instead of a shell.
+    pub mcp_servers: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -180,6 +185,7 @@ impl Default for Profile {
             names: Vec::new(),
             max_depth: 10,
             voice: crate::voice::Voice::Reply,
+            mcp_servers: Vec::new(),
         }
     }
 }
@@ -266,8 +272,13 @@ impl ClaudeCode {
         if !p.mcp {
             args.push("--strict-mcp-config".into());
         }
-        if let Some(config) = run.mcp_config {
-            args.extend(["--mcp-config".into(), config.into()]);
+        if run.mcp_config.is_some() || !p.mcp_servers.is_empty() {
+            // One variadic --mcp-config: parley's own server, then the room's.
+            args.push("--mcp-config".into());
+            args.extend(run.mcp_config.map(String::from));
+            args.extend(p.mcp_servers.iter().map(|f| f.display().to_string()));
+        }
+        if run.mcp_config.is_some() {
             args.extend(["--allowedTools".into(), "mcp__parley__post".into()]);
         }
         args.extend(["--setting-sources".into(), p.settings.join(",")]);
@@ -1244,6 +1255,27 @@ echo '{{"result":"ok"}}'"#,
         let at = args.iter().position(|a| a == "--mcp-config").unwrap();
         assert_eq!(args[at + 1], "{}");
         assert!(args.contains(&"mcp__parley__post".to_owned()));
+    }
+
+    #[test]
+    fn room_mcp_servers_follow_parleys_own_config() {
+        let profile: Profile = toml::from_str(
+            r#"mcp_servers = ["/r/ce.json", "/r/home.json"]"#,
+        )
+        .unwrap();
+        let run = Run {
+            profile: &profile,
+            system_prompt: "s",
+            workdir: Path::new("/"),
+            input: "x",
+            session: None,
+            persist: false,
+            mcp_config: Some("{}"),
+        };
+        let args = ClaudeCode::args(&run);
+        let at = args.iter().position(|a| a == "--mcp-config").unwrap();
+        assert_eq!(args[at + 1..at + 4], ["{}", "/r/ce.json", "/r/home.json"]);
+        assert!(args.contains(&"--strict-mcp-config".to_owned()));
     }
 
     // ---- Agent with a fake harness ----
