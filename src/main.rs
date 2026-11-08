@@ -644,6 +644,7 @@ fn post_content(
 /// The tools of a turn in `room`, in the conversation `here` (a thread
 /// root, or the main timeline), answering `reply_to`: its access rules,
 /// posting, reading and schedules.
+#[allow(clippy::too_many_arguments)]
 async fn tool_turn(
     client: &Client,
     agent: &Arc<Agent<ClaudeCode>>,
@@ -652,6 +653,7 @@ async fn tool_turn(
     here: &Option<OwnedEventId>,
     reply_to: &Option<OwnedEventId>,
     depth: u32,
+    link: &agent::Link,
 ) -> Result<post::Turn> {
     let thread_id = here.as_ref().map(|t| t.as_str());
     let max_depth = agent.max_depth(room.room_id()).await;
@@ -673,6 +675,7 @@ async fn tool_turn(
         schedules: tooling.schedules.clone(),
         depth,
         max_depth,
+        link: link.clone(),
     })
 }
 
@@ -715,6 +718,7 @@ async fn client_tools(
             schedules: tooling.schedules.clone(),
             depth: 0,
             max_depth,
+            link: agent::Link::default(),
         },
     );
     Ok(())
@@ -1177,11 +1181,15 @@ async fn answer(
             return;
         }
     };
+    // Where to watch the run (`trace` in room.toml), once it starts.
+    let link = agent::Link::default();
     // A `reply = "tool"` room posts (and reads) with tools while it runs.
     let ticket = if agent.replies_with_tool(room.room_id()).await {
-        match tool_turn(&client, &agent, &tooling, &room, &thread, &reply_to, depth)
-            .await
-            .and_then(|turn| tooling.posts.register(turn))
+        match tool_turn(
+            &client, &agent, &tooling, &room, &thread, &reply_to, depth, &link,
+        )
+        .await
+        .and_then(|turn| tooling.posts.register(turn))
         {
             Ok(t) => Some(t),
             Err(e) => {
@@ -1202,6 +1210,7 @@ async fn answer(
             &said,
             &members,
             mcp_config.as_deref(),
+            &link,
         )
         .await;
     drop(typing);
@@ -1241,6 +1250,11 @@ async fn answer(
             {
                 eprintln!("could not write transcript: {e}");
             }
+            // In text mode the link goes under the answer.
+            let answer = match link.lock().unwrap().take() {
+                Some(l) => format!("{}\n\n{l}", answer.trim_end()),
+                None => answer,
+            };
             send_text(&room, answer, thread.as_ref(), reply_to.as_ref()).await;
         }
     }

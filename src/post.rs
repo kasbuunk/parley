@@ -89,6 +89,9 @@ pub struct Turn {
     pub depth: u32,
     /// The highest generation this room allows.
     pub max_depth: u32,
+    /// The session viewer's link to this run (`trace` in room.toml), put
+    /// under the first post to the conversation the turn answers.
+    pub link: crate::agent::Link,
 }
 
 struct Entry {
@@ -179,12 +182,14 @@ impl Posts {
                     Target::Thread(t) => Scope::Thread(t.clone()),
                 };
                 a.check(&room, &scope, true)?;
-                let id = (turn.send)(Post {
-                    room,
-                    target,
-                    body: body.to_owned(),
-                })
-                .await?;
+                let mut body = body.to_owned();
+                if room == a.here
+                    && target == Target::Here
+                    && let Some(link) = turn.link.lock().unwrap().take()
+                {
+                    body = format!("{}\n\n{link}", body.trim_end());
+                }
+                let id = (turn.send)(Post { room, target, body }).await?;
                 count.fetch_add(1, Ordering::SeqCst);
                 Ok(format!("Posted ({id})."))
             }
@@ -728,7 +733,33 @@ mod tests {
             schedules: Arc::new(schedule::Store::new(rooms.to_owned())),
             depth: 0,
             max_depth: 10,
+            link: crate::agent::Link::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn the_first_post_here_carries_the_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let posts = Arc::new(Posts::default());
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let t = turn(got.clone(), Arc::default(), tmp.path());
+        *t.link.lock().unwrap() = Some("[🔍 sessie](u)".into());
+        let ticket = posts.register(t).unwrap();
+        let tok = &ticket.token;
+        posts
+            .call(tok, "post", &json!({"body": "x", "thread": "main"}))
+            .await
+            .unwrap();
+        posts
+            .call(tok, "post", &json!({"body": "one\n"}))
+            .await
+            .unwrap();
+        posts
+            .call(tok, "post", &json!({"body": "two"}))
+            .await
+            .unwrap();
+        let bodies: Vec<String> = got.lock().unwrap().iter().map(|p| p.body.clone()).collect();
+        assert_eq!(bodies, ["x", "one\n\n[🔍 sessie](u)", "two"]);
     }
 
     #[tokio::test]

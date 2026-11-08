@@ -117,6 +117,11 @@ pub struct Profile {
     /// What to do with voice messages: `reply` (transcribe and show the
     /// transcript, the default), `quiet` (transcribe only) or `off`.
     pub voice: crate::voice::Voice,
+    /// Base URL of a session viewer (agentsview), e.g.
+    /// `https://agents.lab.artintel.ai`. With it, every run keeps its
+    /// Claude Code session file, and its first post here links to
+    /// `<trace>/sessions/<session id>`, so a run can be followed live.
+    pub trace: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -180,6 +185,7 @@ impl Default for Profile {
             names: Vec::new(),
             max_depth: 10,
             voice: crate::voice::Voice::Reply,
+            trace: None,
         }
     }
 }
@@ -199,6 +205,9 @@ pub struct Run<'a> {
     pub input: &'a str,
     /// Session to continue, if any.
     pub session: Option<&'a str>,
+    /// ID for a new session (without `session`), so it is known before
+    /// the run starts.
+    pub new_session: Option<&'a str>,
     /// Whether the harness should keep the session for a later turn.
     pub persist: bool,
     /// Extra MCP servers for this run (`--mcp-config` JSON), e.g. parley's
@@ -285,6 +294,8 @@ impl ClaudeCode {
         }
         if let Some(session) = run.session {
             args.extend(["--resume".into(), session.into()]);
+        } else if let Some(id) = run.new_session {
+            args.extend(["--session-id".into(), id.into()]);
         }
         args.extend(["--output-format".into(), "json".into()]);
         args
@@ -411,13 +422,21 @@ impl<H: Harness> Agent<H> {
         body: &str,
         members: &[OwnedUserId],
     ) -> String {
-        self.reply_with(room_id, thread, &[Said::new(sender, body)], members, None)
-            .await
+        self.reply_with(
+            room_id,
+            thread,
+            &[Said::new(sender, body)],
+            members,
+            None,
+            &Link::default(),
+        )
+        .await
     }
 
     /// [`Agent::reply`] to one or more messages, giving the run the extra
     /// MCP servers in `mcp_config`; with one, the system prompt tells the
-    /// agent to post with the `post` tool.
+    /// agent to post with the `post` tool. In a room with `trace`, `link`
+    /// gets the session viewer's link to the run before it starts.
     pub async fn reply_with(
         &self,
         room_id: &RoomId,
@@ -425,6 +444,7 @@ impl<H: Harness> Agent<H> {
         said: &[Said],
         members: &[OwnedUserId],
         mcp_config: Option<&str>,
+        link: &Link,
     ) -> String {
         let lock = self
             .conv_locks
@@ -442,7 +462,10 @@ impl<H: Harness> Agent<H> {
             );
         }
 
-        match self.run(room_id, thread, said, members, mcp_config).await {
+        match self
+            .run(room_id, thread, said, members, mcp_config, link)
+            .await
+        {
             Ok(text) => {
                 self.breaker.lock().unwrap().success();
                 text
@@ -606,6 +629,7 @@ impl<H: Harness> Agent<H> {
                         workdir: &dir,
                         input: &job.input,
                         session: None,
+                        new_session: None,
                         persist: false,
                         mcp_config: None,
                     })
@@ -640,6 +664,7 @@ impl<H: Harness> Agent<H> {
                 workdir: &dir,
                 input: &input,
                 session: None,
+                new_session: None,
                 persist: false,
                 mcp_config: None,
             })
@@ -859,6 +884,7 @@ impl<H: Harness> Agent<H> {
         said: &[Said],
         members: &[OwnedUserId],
         mcp_config: Option<&str>,
+        link: &Link,
     ) -> Result<String> {
         let dir = self.room_dir(room_id)?;
         tokio::fs::create_dir_all(&dir).await?;
@@ -940,13 +966,24 @@ impl<H: Harness> Agent<H> {
             }
         };
         let workdir = profile.workdir.clone().unwrap_or_else(|| dir.clone());
+        // With a session viewer, name a new session up front and say where
+        // to watch it; Claude Code keeps the ID when it resumes one.
+        let new_session = match (&profile.trace, &session) {
+            (Some(_), None) => Some(new_session_id()?),
+            _ => None,
+        };
+        if let (Some(base), Some(id)) = (&profile.trace, session.as_ref().or(new_session.as_ref()))
+        {
+            *link.lock().unwrap() = Some(trace_link(base, id));
+        }
         let run = Run {
             profile: &profile,
             system_prompt: &system_prompt,
             workdir: &workdir,
             input: &input,
             session: session.as_deref(),
-            persist: mode.resumes(),
+            new_session: new_session.as_deref(),
+            persist: mode.resumes() || profile.trace.is_some(),
             mcp_config,
         };
         match self.harness.run(&run).await {
@@ -992,6 +1029,33 @@ impl<H: Harness> Agent<H> {
             }
         }
     }
+}
+
+/// Where a turn's session can be watched, once known: set by
+/// [`Agent::reply_with`], taken by the turn's first post.
+pub type Link = Arc<std::sync::Mutex<Option<String>>>;
+
+/// The session viewer's page of session `id`, as a Markdown link.
+pub fn trace_link(base: &str, id: &str) -> String {
+    format!("[🔍 sessie]({}/sessions/{id})", base.trim_end_matches('/'))
+}
+
+/// A random (version 4) UUID, the form Claude Code wants for `--session-id`.
+fn new_session_id() -> Result<String> {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    ))
 }
 
 fn now() -> u64 {
@@ -1097,6 +1161,7 @@ mod tests {
                 workdir,
                 input,
                 session: None,
+                new_session: None,
                 persist: false,
                 mcp_config: None,
             };
@@ -1237,6 +1302,7 @@ echo '{{"result":"ok"}}'"#,
             workdir: Path::new("/"),
             input: "x",
             session: None,
+            new_session: None,
             persist: false,
             mcp_config: Some("{}"),
         };
@@ -1254,6 +1320,7 @@ echo '{{"result":"ok"}}'"#,
         workdir: PathBuf,
         input: String,
         session: Option<String>,
+        new_session: Option<String>,
         persist: bool,
     }
 
@@ -1292,6 +1359,7 @@ echo '{{"result":"ok"}}'"#,
                 workdir: run.workdir.to_owned(),
                 input: input.to_owned(),
                 session: run.session.map(ToOwned::to_owned),
+                new_session: run.new_session.map(ToOwned::to_owned),
                 persist: run.persist,
             });
             if self.sleepy {
@@ -1387,9 +1455,86 @@ echo '{{"result":"ok"}}'"#,
         let agent = Agent::new(Fake::default(), tmp.path().to_owned());
         let said = [Said::new("Kas", "one"), Said::new("Camille", "two")];
         agent
-            .reply_with(&room("!a:example.org"), None, &said, &[], None)
+            .reply_with(
+                &room("!a:example.org"),
+                None,
+                &said,
+                &[],
+                None,
+                &Link::default(),
+            )
             .await;
         assert_eq!(agent.harness.calls()[0].input, "[Kas] one\n\n[Camille] two");
+    }
+
+    #[tokio::test]
+    async fn trace_names_a_new_session_and_links_to_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = Agent::new(Fake::default(), tmp.path().to_owned());
+        let r = room("!a:example.org");
+        let dir = tmp.path().join(r.as_str());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("room.toml"),
+            "trace = \"https://agents.example/\"\n",
+        )
+        .unwrap();
+        let link = Link::default();
+        agent
+            .reply_with(&r, None, &[Said::new("Kas", "hi")], &[], None, &link)
+            .await;
+        let call = &agent.harness.calls()[0];
+        let id = call.new_session.clone().expect("a new session ID");
+        assert_eq!(id.len(), 36);
+        assert_eq!(&id[14..15], "4");
+        assert!(call.persist, "the viewer needs the session file");
+        assert_eq!(
+            link.lock().unwrap().as_deref(),
+            Some(format!("[🔍 sessie](https://agents.example/sessions/{id})").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn no_trace_no_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = Agent::new(Fake::default(), tmp.path().to_owned());
+        let link = Link::default();
+        agent
+            .reply_with(
+                &room("!a:example.org"),
+                None,
+                &[Said::new("Kas", "hi")],
+                &[],
+                None,
+                &link,
+            )
+            .await;
+        let call = &agent.harness.calls()[0];
+        assert_eq!(call.new_session, None);
+        assert!(!call.persist);
+        assert!(link.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_new_session_id_is_passed_unless_one_is_resumed() {
+        let profile = Profile::default();
+        let mut run = Run {
+            profile: &profile,
+            system_prompt: "s",
+            workdir: Path::new("/"),
+            input: "x",
+            session: None,
+            new_session: Some("u-1"),
+            persist: true,
+            mcp_config: None,
+        };
+        let args = ClaudeCode::args(&run);
+        let at = args.iter().position(|a| a == "--session-id").unwrap();
+        assert_eq!(args[at + 1], "u-1");
+        run.session = Some("old");
+        let args = ClaudeCode::args(&run);
+        assert!(!args.contains(&"--session-id".to_owned()));
+        assert!(args.contains(&"--resume".to_owned()));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

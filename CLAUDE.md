@@ -88,6 +88,12 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
   text message `🎤 <transcript>`. `voice` in room.toml: `reply` (default:
   the transcript is also posted as a reply, where the answer will come),
   `quiet`, or `off`. A 5-second clip takes about 20 s.
+- Tracing: `trace = "https://agents.lab.artintel.ai"` in room.toml makes
+  every run keep its Claude Code session file (a new session gets its ID
+  up front with `--session-id`) and puts `[🔍 sessie](<trace>/sessions/<id>)`
+  under the turn's first post here (or under a text answer). The viewer
+  is agentsview (`~/.config/nixos/modules/agentsview.nix`), which reads
+  `~/.claude/projects` live; on in life, nixos, artintel and parley.
 - `src/breaker.rs`: the circuit breaker (also used for the Matrix sync loop).
 
 ## State on the lab
