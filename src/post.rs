@@ -236,6 +236,9 @@ impl Posts {
                     chrono::Utc::now(),
                 )?;
                 job.depth = turn.depth;
+                if room != a.here {
+                    job.from = Some(a.here_name());
+                }
                 turn.schedules.create(&job)?;
                 Ok(format!("Scheduled: {}", job.describe()))
             }
@@ -383,6 +386,16 @@ returns a page, newest first unless `order: \"oldest\"`, filtered by \
 (YYYY-MM-DD or unix seconds), `sender` and `contains`, with a cursor for \
 the next page. Use it when the past matters instead of guessing. `post` \
 takes a `room` too.\n\n\
+## Other rooms\n\n\
+Where `rooms` says you may post, you may do what Kas would otherwise do \
+for you there: when work belongs in another room, hand it over yourself \
+instead of asking Kas to. A `post` there only informs (the bot's own \
+messages start no run); to have that room's agent act, `schedule` a run \
+there (`in: \"1m\"`) with a self-contained prompt, and say here what you \
+handed over. Keep it one hop: do not hand work back to a room that \
+handed it to you, do not ask for a reply, and do not schedule follow-ups \
+in another room to check on it. Read that room later if you need to know \
+how it went.\n\n\
 ## Schedules\n\n\
 Your run ends with this turn, but you can plan later ones: `schedule` \
 starts a run at a time (`at`, `in`), repeatedly (`every`, `cron`, with \
@@ -893,6 +906,29 @@ mod tests {
         let r = call_as(within.token.clone(), args).await.unwrap().unwrap();
         assert!(r.contains("generation 10"), "{r}");
         drop((over, within));
+
+        // Handed to another room: its runs are told where from, and not
+        // to send anything back.
+        let mut t = turn(got.clone(), Arc::default(), tmp.path());
+        let names = [("life".to_owned(), "!life:x".to_owned())].into();
+        let grants = [Grant {
+            room: "life".into(),
+            thread: None,
+            read: true,
+            write: true,
+        }];
+        t.access = Access::new("!me:x", Some("parley"), Some("$here"), &grants, &names).0;
+        let other = posts.register(t).unwrap();
+        let args = json!({"prompt": "do it there", "in": "1m", "room": "life"});
+        call_as(other.token.clone(), args).await.unwrap().unwrap();
+        let jobs = schedule::Store::new(tmp.path().to_owned())
+            .list("!life:x")
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].from.as_deref(), Some("parley"));
+        let msg = schedule::fire_message(&jobs[0], None);
+        assert!(msg.contains("back to parley"), "{msg}");
+        drop(other);
 
         drop(ticket);
         let e = call("post", json!({"body": "late"}))

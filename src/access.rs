@@ -95,6 +95,12 @@ pub struct Access {
 }
 
 impl Access {
+    /// The room the turn answers, by name when it has one.
+    pub fn here_name(&self) -> String {
+        let r = &self.rules[0];
+        r.name.clone().unwrap_or_else(|| r.room.clone())
+    }
+
     /// Rules for a turn in `here` (named `name`), answering `thread` (or the
     /// main timeline), with the room's grants. `names` maps room names to
     /// IDs; a grant naming an unknown room is skipped, and reported back.

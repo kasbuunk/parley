@@ -71,6 +71,10 @@ pub struct Job {
     /// make schedules cannot loop forever.
     #[serde(default)]
     pub depth: u32,
+    /// The room it was made in, when that is another room (its name, or
+    /// its ID): the run is told so, and not to send anything back there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
 }
 
 /// At most this many live schedules per room.
@@ -184,6 +188,7 @@ impl Request {
             created: now,
             by: by.to_owned(),
             depth: 0,
+            from: None,
         };
         job.next = job.first();
         if job.next.is_none() {
@@ -557,10 +562,19 @@ pub fn fire_message(job: &Job, board: Option<&str>) -> String {
         Some(b) => format!("Handoff from the previous run:\n\n{b}"),
         None => "No handoff from a previous run yet.".into(),
     };
+    let from = match &job.from {
+        Some(r) => format!(
+            "\n\nThe agent of room {r} scheduled this to hand you the work. Do it, \
+             and post the result here, in this room. Do not post or schedule anything \
+             back to {r}: Kas reads both rooms, and sending back is how agents end up \
+             answering each other in a loop."
+        ),
+        None => String::new(),
+    };
     format!(
         "[schedule {id}: {runs}, {next}. Nobody sent this message; the schedule did. \
          Leave what the next run needs with `handoff(id: \"{id}\", text)`; end the \
-         schedule with `cancel(id: \"{id}\")`.]\n\n{prompt}\n\n{board}",
+         schedule with `cancel(id: \"{id}\")`.]{from}\n\n{prompt}\n\n{board}",
         id = job.id,
         prompt = job.prompt,
     )
