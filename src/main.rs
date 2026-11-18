@@ -36,6 +36,7 @@
 
 mod access;
 mod agent;
+mod ask;
 mod breaker;
 mod clients;
 mod layered;
@@ -73,6 +74,7 @@ use matrix_sdk::{
         OwnedEventId, OwnedRoomId, OwnedUserId, RoomId,
         api::{client::uiaa, error::ErrorKind},
         events::key::verification::request::ToDeviceKeyVerificationRequestEvent,
+        events::poll::unstable_response::OriginalSyncUnstablePollResponseEvent,
         events::reaction::ReactionEventContent,
         events::relation::{Annotation, Thread},
         events::room::{
@@ -215,6 +217,7 @@ async fn main() -> Result<()> {
         schedules: Arc::new(schedule::Store::new(config.data_dir.join("rooms"))),
         runs: Runs::default(),
         inbox: Inbox::default(),
+        asks: Arc::new(ask::Asks::new(config.data_dir.join("rooms"))),
     });
     post::listen(&tooling.socket, tooling.posts.clone())?;
     // Standing clients (clients.rs): the tools for agents outside our runs.
@@ -231,6 +234,7 @@ async fn main() -> Result<()> {
     }
     client.add_event_handler_context(tooling.clone());
     client.add_event_handler(on_message);
+    client.add_event_handler(on_vote);
     let allowed = config.allowed.clone();
     client.add_event_handler(
         move |ev: ToDeviceKeyVerificationRequestEvent, client: Client| {
@@ -421,6 +425,8 @@ struct Tooling {
     schedules: Arc<schedule::Store>,
     runs: Runs,
     inbox: Inbox,
+    /// Questions asked as polls (ask.rs).
+    asks: Arc<ask::Asks>,
 }
 
 /// A message, or a schedule's fire, waiting for its conversation's turn.
@@ -684,7 +690,112 @@ async fn tool_turn(
         max_depth,
         link: link.clone(),
         signer,
+        ask: Some(ask_tool(client, tooling, room, here, reply_to)),
     })
+}
+
+/// Asking in `room`'s conversation `here` (after `reply_to`): post the
+/// question as a poll that mentions the room's people, and wait for it.
+fn ask_tool(
+    client: &Client,
+    tooling: &Tooling,
+    room: &Room,
+    here: &Option<OwnedEventId>,
+    reply_to: &Option<OwnedEventId>,
+) -> post::AskFn {
+    let (client, asks, room) = (client.clone(), tooling.asks.clone(), room.clone());
+    let (here, reply_to) = (here.clone(), reply_to.clone());
+    Arc::new(move |q: ask::Question| {
+        let (client, asks, room) = (client.clone(), asks.clone(), room.clone());
+        let (here, reply_to) = (here.clone(), reply_to.clone());
+        Box::pin(async move {
+            let me = client.user_id().map(ToOwned::to_owned);
+            let people: Vec<String> = room
+                .members(RoomMemberships::JOIN)
+                .await?
+                .iter()
+                .map(|m| m.user_id().to_owned())
+                .filter(|id| Some(id) != me.as_ref())
+                .map(|id| id.to_string())
+                .collect();
+            let thread = here.as_ref().map(|root| {
+                let latest = reply_to.as_ref().unwrap_or(root);
+                (root.as_str(), latest.as_str())
+            });
+            let content = q.poll(&people, thread);
+            let sent = room
+                .send_raw("org.matrix.msc3381.poll.start", content)
+                .await?;
+            let poll = sent.response.event_id.to_string();
+            let thread_id = here.as_ref().map(|t| t.as_str());
+            println!("[{}] asked {poll}: {}", room.room_id(), q.question);
+            asks.wait(room.room_id().as_str(), thread_id, &poll, &q)
+        })
+    })
+}
+
+/// A vote on a poll: the answer to a question a run asked (ask.rs). A
+/// vote nobody waits for any more starts a turn, like a message.
+async fn on_vote(
+    ev: OriginalSyncUnstablePollResponseEvent,
+    room: Room,
+    client: Client,
+    Ctx(agent): Ctx<Arc<Agent<ClaudeCode>>>,
+    Ctx(tooling): Ctx<Arc<Tooling>>,
+) {
+    if room.state() != RoomState::Joined || Some(ev.sender.as_ref()) == client.user_id() {
+        return;
+    }
+    let poll = ev.content.relates_to.event_id.clone();
+    let room_id = room.room_id().to_owned();
+    let vote = tooling.asks.vote(
+        room_id.as_str(),
+        poll.as_str(),
+        &ev.content.poll_response.answers,
+    );
+    println!("[{room_id}] {} voted on {poll}: {vote:?}", ev.sender);
+    match vote {
+        ask::Vote::Unknown | ask::Vote::Other => return,
+        ask::Vote::Answered | ask::Vote::Late { .. } => {
+            let end = serde_json::json!({
+                "org.matrix.msc3381.poll.end": {},
+                "org.matrix.msc1767.text": "Beantwoord.",
+                "m.relates_to": {"rel_type": "m.reference", "event_id": poll},
+            });
+            if let Err(e) = room.send_raw("org.matrix.msc3381.poll.end", end).await {
+                eprintln!("could not end poll {poll}: {e}");
+            }
+        }
+    }
+    let ask::Vote::Late { thread, message } = vote else {
+        return;
+    };
+    tokio::spawn(async move {
+        if let Err(e) = agent
+            .record(&room_id, thread.as_deref(), ev.sender.as_str(), &message)
+            .await
+        {
+            eprintln!("could not write transcript: {e}");
+        }
+        let sender = match room.get_member_no_sync(&ev.sender).await {
+            Ok(Some(member)) => member.name().to_owned(),
+            _ => ev.sender.localpart().to_owned(),
+        };
+        let root = thread
+            .as_deref()
+            .and_then(|t| OwnedEventId::try_from(t).ok());
+        let idle = tooling.inbox.push(
+            (room_id, thread),
+            Queued {
+                said: Said::new(sender, message),
+                reply_to: Some(ev.event_id.clone()),
+                depth: 0,
+            },
+        );
+        if idle {
+            converse(client, agent, tooling, room, root).await;
+        }
+    });
 }
 
 /// A standing client's tools: its home room, its grants, no conversation
@@ -728,6 +839,7 @@ async fn client_tools(
             max_depth,
             link: agent::Link::default(),
             signer: name.to_owned(),
+            ask: None,
         },
     );
     Ok(())
@@ -999,6 +1111,17 @@ async fn on_message(
             send_text(&room, text, thread.as_ref(), Some(&reply_to)).await;
             return;
         }
+        // A run waiting for an answer to its question here gets this one.
+        if command.is_none()
+            && !push
+            && let Some(poll) =
+                tooling
+                    .asks
+                    .text(room.room_id().as_str(), thread_id.as_deref(), &body)
+        {
+            println!("[{}] answered {poll} in text", room.room_id());
+            return;
+        }
         if !wakes {
             return;
         }
@@ -1065,6 +1188,8 @@ enum Command {
     Schedules,
     /// `!cancel <id>`: end a schedule.
     Cancel(String),
+    /// `!vragen` / `!questions`: the room's open questions (ask.rs).
+    Questions,
 }
 
 impl Command {
@@ -1079,6 +1204,7 @@ impl Command {
             "!stop" if arg.is_none() => Some(Self::Stop),
             "!schedules" if arg.is_none() => Some(Self::Schedules),
             "!cancel" => Some(Self::Cancel(rest.to_owned())),
+            "!vragen" | "!questions" if arg.is_none() => Some(Self::Questions),
             _ => None,
         }
     }
@@ -1135,6 +1261,17 @@ async fn run_command(
             Ok(_) => format!("_Cancelled `{id}`; it fires no more._"),
             Err(e) => format!("_Could not cancel: {e}_"),
         },
+        Command::Questions => {
+            let open = tooling.asks.open(room.as_str());
+            if open.is_empty() {
+                "_No open questions in this room._".to_owned()
+            } else {
+                open.iter()
+                    .map(|q| format!("- ❓ {q}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
     }
 }
 

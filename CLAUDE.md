@@ -46,6 +46,17 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
   It may post several times or not at all. A final answer of `[silent]`
   (no posts) gets a ✓ reaction; any other final text with no posts is
   posted as a fallback, so errors still show.
+- `src/ask.rs`: questions as Matrix polls. Claude Code's own
+  `AskUserQuestion` is handed to parley's MCP tool `approve`
+  (`--permission-prompt-tool`, hidden from the model with
+  `--disallowedTools`); parley posts each question as a poll (options plus
+  "Anders, namelijk…", mentioning the room's people) in the turn's
+  conversation and waits up to 10 min for a vote, or for any text message
+  there (not `!!`), which then answers it instead of starting a turn. The
+  answers go back as `AskUserQuestion`'s `answers`. Unanswered, the model
+  is told to end its turn; a later vote starts a turn with
+  `🗳️ <question> → <answer>`. Open polls: `polls/<event id>.json` per
+  room; `!vragen` lists them.
 - `src/access.rs`: what a turn may read and post to. Its own room always;
   other rooms, their main timeline, or single threads through
   `[[access]]` tables in room.toml (`room` = ID or another room's `name`,

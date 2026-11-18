@@ -97,7 +97,17 @@ pub struct Turn {
     /// room are signed with it and the room's name, since every room's
     /// posts come from the same account.
     pub signer: String,
+    /// Posts a question as a poll in the turn's conversation and waits
+    /// for its answer (ask.rs); none for a standing client.
+    pub ask: Option<AskFn>,
 }
+
+/// Posts a poll for the question; the answer arrives on the receiver.
+pub type AskFn = Arc<
+    dyn Fn(crate::ask::Question) -> Future_<Result<tokio::sync::oneshot::Receiver<String>>>
+        + Send
+        + Sync,
+>;
 
 /// `body` signed as `**who** (room): …`, unless the agent signed it so
 /// already.
@@ -299,9 +309,58 @@ impl Posts {
                 turn.schedules.handoff(&room, id, s("text").unwrap_or(""))?;
                 Ok(format!("Saved; the next run of `{id}` gets it."))
             }
+            "approve" => approve(&turn, args).await,
             _ => bail!("unknown tool {tool:?}"),
         }
     }
+}
+
+/// Claude Code's permission prompt (`--permission-prompt-tool`): its
+/// answer is JSON. Only `AskUserQuestion` needs a person; it is asked as
+/// polls (ask.rs), and the answers go back in its input. Anything else is
+/// allowed as it is (the room's permission mode decides).
+async fn approve(turn: &Turn, args: &Value) -> Result<String> {
+    use crate::ask;
+    let input = args.get("input").cloned().unwrap_or(json!({}));
+    let allow = |input: Value| json!({"behavior": "allow", "updatedInput": input}).to_string();
+    let deny = |message: String| json!({"behavior": "deny", "message": message}).to_string();
+    if args.get("tool_name").and_then(Value::as_str) != Some("AskUserQuestion") {
+        return Ok(allow(input));
+    }
+    let Some(ask_fn) = &turn.ask else {
+        return Ok(deny(
+            "No one can be asked from here; decide yourself, or say what you need in your answer."
+                .into(),
+        ));
+    };
+    let questions = match ask::questions(&input) {
+        Ok(q) => q,
+        Err(e) => return Ok(deny(format!("Not asked: {e:#}"))),
+    };
+    let mut waits = Vec::new();
+    for q in questions {
+        match ask_fn(q.clone()).await {
+            Ok(rx) => waits.push((q, rx)),
+            Err(e) => return Ok(deny(format!("Could not post the question: {e:#}"))),
+        }
+    }
+    let deadline = tokio::time::Instant::now() + ask::WAIT;
+    let mut answers = Vec::new();
+    for (q, rx) in waits {
+        match tokio::time::timeout_at(deadline, rx).await {
+            Ok(Ok(a)) => answers.push((q.question, a)),
+            _ => {
+                return Ok(deny(format!(
+                    "No answer within {} minutes. The question stays open in the room as a \
+                     poll; the answer will start a new turn here. Do not act on what you \
+                     asked: finish this turn now, saying briefly in a post what waits on \
+                     the answer.",
+                    ask::WAIT.as_secs() / 60
+                )));
+            }
+        }
+    }
+    Ok(allow(ask::answered(&input, &answers)))
 }
 
 fn random_token() -> Result<String> {
@@ -421,7 +480,15 @@ starts a run at a time (`at`, `in`), repeatedly (`every`, `cron`, with \
 fire when nobody wrote since the last run. `schedules` lists them, \
 `cancel` ends one. For long work, do a step, `handoff` what the next run \
 needs, and schedule it: state lives on, the process does not. A message \
-starting with `[schedule <id>: …]` was sent by a schedule, not a person.\n";
+starting with `[schedule <id>: …]` was sent by a schedule, not a person.\n\n\
+## Asking\n\n\
+A question in a long post is easily missed. When you need a decision \
+from a person, ask with `AskUserQuestion`: parley posts it as a poll \
+that notifies them, with an \"Other\" answer they can type, and gives you \
+the answer. Use it too before something important, risky or hard to \
+undo (deleting, force-pushing, spending money, sending something \
+outside). If nobody answers within ten minutes you are told so; then end \
+your turn: the answer will start a new one.\n";
 
 /// The final answers that mean "nothing more to post": empty, or a
 /// `[posted]` / `[silent]` marker as the last line. Models often write a
@@ -505,6 +572,11 @@ fn tools() -> Value {
             "name": "handoff",
             "description": "Replace a schedule's scratchboard: what its next run is shown first. Use it at the end of a scheduled run to hand over state (what was done, what is next).",
             "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "room": room}, "required": ["id", "text"]}
+        },
+        {
+            "name": "approve",
+            "description": "Claude Code's permission prompt; parley answers AskUserQuestion with polls. Not for the model.",
+            "inputSchema": {"type": "object", "properties": {"tool_name": {"type": "string"}, "input": {"type": "object"}, "tool_use_id": {"type": "string"}}}
         }
     ])
 }
@@ -533,9 +605,8 @@ pub fn handle_rpc(msg: &Value, call: &mut CallFn<'_>) -> Option<Value> {
                 "post" if args.get("body").and_then(Value::as_str).is_none() => {
                     Err("`body` is required".to_owned())
                 }
-                "post" | "read" | "rooms" | "schedule" | "schedules" | "cancel" | "handoff" => {
-                    call(name, &args)
-                }
+                "post" | "read" | "rooms" | "schedule" | "schedules" | "cancel" | "handoff"
+                | "approve" => call(name, &args),
                 _ => Err(format!("unknown tool {name:?}")),
             };
             let (text, is_error) = match outcome {
@@ -680,7 +751,8 @@ mod tests {
                 "schedule",
                 "schedules",
                 "cancel",
-                "handoff"
+                "handoff",
+                "approve"
             ]
         );
         let c = handle_rpc(
@@ -766,6 +838,7 @@ mod tests {
             max_depth: 10,
             link: crate::agent::Link::default(),
             signer: "Reinout".into(),
+            ask: None,
         }
     }
 
@@ -775,6 +848,51 @@ mod tests {
         assert_eq!(
             sign("\n**Wouter** (nixos): hi", "Wouter", "nixos"),
             "**Wouter** (nixos): hi"
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_asks_and_returns_the_answers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let posts = Arc::new(Posts::default());
+        let mut t = turn(Arc::default(), Arc::default(), tmp.path());
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let a = asked.clone();
+        t.ask = Some(Arc::new(move |q: crate::ask::Question| {
+            a.lock().unwrap().push(q.question.clone());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tx.send(format!("yes to {}", q.question)).unwrap();
+            Box::pin(async move { Ok(rx) })
+        }));
+        let ticket = posts.register(t).unwrap();
+        let input = json!({"questions": [
+            {"question": "Q1?", "header": "a", "options": [{"label": "yes", "description": ""}], "multiSelect": false},
+            {"question": "Q2?", "header": "b", "options": [{"label": "no", "description": ""}], "multiSelect": false}
+        ]});
+        let out = posts
+            .call(
+                &ticket.token,
+                "approve",
+                &json!({"tool_name": "AskUserQuestion", "input": input}),
+            )
+            .await
+            .unwrap();
+        let out: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(out["behavior"], "allow");
+        assert_eq!(out["updatedInput"]["answers"]["Q2?"], "yes to Q2?");
+        assert_eq!(*asked.lock().unwrap(), ["Q1?", "Q2?"]);
+        // Other tools pass as they are.
+        let out = posts
+            .call(
+                &ticket.token,
+                "approve",
+                &json!({"tool_name": "Bash", "input": {"command": "ls"}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap(),
+            json!({"behavior": "allow", "updatedInput": {"command": "ls"}})
         );
     }
 

@@ -278,6 +278,14 @@ impl ClaudeCode {
         if let Some(config) = run.mcp_config {
             args.extend(["--mcp-config".into(), config.into()]);
             args.extend(["--allowedTools".into(), "mcp__parley__post".into()]);
+            // `AskUserQuestion` goes to parley, which asks with a poll
+            // (ask.rs); the model does not see the tool itself.
+            args.extend([
+                "--permission-prompt-tool".into(),
+                "mcp__parley__approve".into(),
+                "--disallowedTools".into(),
+                "mcp__parley__approve".into(),
+            ]);
         }
         args.extend(["--setting-sources".into(), p.settings.join(",")]);
         if p.settings.is_empty() {
@@ -1310,6 +1318,11 @@ echo '{{"result":"ok"}}'"#,
         let at = args.iter().position(|a| a == "--mcp-config").unwrap();
         assert_eq!(args[at + 1], "{}");
         assert!(args.contains(&"mcp__parley__post".to_owned()));
+        let at = args
+            .iter()
+            .position(|a| a == "--permission-prompt-tool")
+            .unwrap();
+        assert_eq!(args[at + 1], "mcp__parley__approve");
     }
 
     // ---- Agent with a fake harness ----
