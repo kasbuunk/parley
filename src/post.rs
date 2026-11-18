@@ -92,6 +92,21 @@ pub struct Turn {
     /// The session viewer's link to this run (`trace` in room.toml), put
     /// under the first post to the conversation the turn answers.
     pub link: crate::agent::Link,
+    /// Who posts, as people know them: the bot's display name in the
+    /// turn's own room (a standing client: its name). Posts to another
+    /// room are signed with it and the room's name, since every room's
+    /// posts come from the same account.
+    pub signer: String,
+}
+
+/// `body` signed as `**who** (room): …`, unless the agent signed it so
+/// already.
+pub fn sign(body: &str, who: &str, room: &str) -> String {
+    let body = body.trim_start();
+    if body.starts_with(&format!("**{who}**")) {
+        return body.to_owned();
+    }
+    format!("**{who}** ({room}): {body}")
 }
 
 struct Entry {
@@ -188,6 +203,9 @@ impl Posts {
                     && let Some(link) = turn.link.lock().unwrap().take()
                 {
                     body = format!("{}\n\n{link}", body.trim_end());
+                }
+                if room != a.here {
+                    body = sign(&body, &turn.signer, &a.here_name());
                 }
                 let id = (turn.send)(Post { room, target, body }).await?;
                 count.fetch_add(1, Ordering::SeqCst);
@@ -747,7 +765,42 @@ mod tests {
             depth: 0,
             max_depth: 10,
             link: crate::agent::Link::default(),
+            signer: "Reinout".into(),
         }
+    }
+
+    #[test]
+    fn signing() {
+        assert_eq!(sign("hi", "Wouter", "nixos"), "**Wouter** (nixos): hi");
+        assert_eq!(
+            sign("\n**Wouter** (nixos): hi", "Wouter", "nixos"),
+            "**Wouter** (nixos): hi"
+        );
+    }
+
+    #[tokio::test]
+    async fn posts_to_another_room_are_signed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let posts = Arc::new(Posts::default());
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let mut t = turn(got.clone(), Arc::default(), tmp.path());
+        let names = [("life".to_owned(), "!life:x".to_owned())].into();
+        let grants = [Grant {
+            room: "life".into(),
+            thread: None,
+            read: true,
+            write: true,
+        }];
+        t.access = Access::new("!me:x", Some("parley"), Some("$here"), &grants, &names).0;
+        let ticket = posts.register(t).unwrap();
+        for args in [
+            json!({"body": "here"}),
+            json!({"body": "there", "room": "life"}),
+        ] {
+            posts.call(&ticket.token, "post", &args).await.unwrap();
+        }
+        let bodies: Vec<String> = got.lock().unwrap().iter().map(|p| p.body.clone()).collect();
+        assert_eq!(bodies, ["here", "**Reinout** (parley): there"]);
     }
 
     #[tokio::test]

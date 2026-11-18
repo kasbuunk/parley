@@ -668,6 +668,13 @@ async fn tool_turn(
         here.clone(),
         reply_to.clone(),
     );
+    let signer = match client.user_id() {
+        Some(me) => match room.get_member_no_sync(me).await {
+            Ok(Some(m)) => m.name().to_owned(),
+            _ => me.localpart().to_owned(),
+        },
+        None => "agent".to_owned(),
+    };
     Ok(post::Turn {
         access,
         send,
@@ -676,6 +683,7 @@ async fn tool_turn(
         depth,
         max_depth,
         link: link.clone(),
+        signer,
     })
 }
 
@@ -719,6 +727,7 @@ async fn client_tools(
             depth: 0,
             max_depth,
             link: agent::Link::default(),
+            signer: name.to_owned(),
         },
     );
     Ok(())
