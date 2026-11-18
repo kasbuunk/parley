@@ -34,7 +34,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use crate::{
     access::{Access, Scope},
-    read, schedule,
+    read, schedule, tasks,
 };
 
 /// Where in its room a post goes.
@@ -100,6 +100,10 @@ pub struct Turn {
     /// Posts a question as a poll in the turn's conversation and waits
     /// for its answer (ask.rs); none for a standing client.
     pub ask: Option<AskFn>,
+    /// Where the `task` tool writes its notes (tasks.rs); none: no tool.
+    pub tasks: Option<Arc<crate::tasks::Store>>,
+    /// The people in the turn's room, as (Matrix ID, name): whom a task is for.
+    pub people: Vec<(String, String)>,
 }
 
 /// Posts a poll for the question; the answer arrives on the receiver.
@@ -310,6 +314,62 @@ impl Posts {
                 Ok(format!("Saved; the next run of `{id}` gets it."))
             }
             "approve" => approve(&turn, args).await,
+            "task" => {
+                let store = turn
+                    .tasks
+                    .as_ref()
+                    .context("tasks are not set up here (no tasks.toml)")?;
+                let title = s("title").unwrap_or("").trim();
+                let body = s("body").unwrap_or("").trim();
+                if title.is_empty() || body.is_empty() {
+                    bail!("`title` and `body` are required");
+                }
+                a.check(&a.here, &a.here_scope, true)?;
+                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                let mut task = tasks::Task {
+                    title: title.to_owned(),
+                    body: body.to_owned(),
+                    from: turn.signer.clone(),
+                    room: a.here_name(),
+                    created: today.clone(),
+                    due: s("due")
+                        .map(str::trim)
+                        .filter(|d| !d.is_empty())
+                        .map(str::to_owned),
+                    event: None,
+                    room_id: a.here.clone(),
+                    done: false,
+                };
+                let path = store.path_for(&today, title)?;
+                let link = store.link(&path);
+                let mut body = tasks::post_body(&task, &turn.people, &link);
+                if let Some(l) = turn.link.lock().unwrap().take() {
+                    body = format!("{body}\n\n{l}");
+                }
+                let id = (turn.send)(Post {
+                    room: a.here.clone(),
+                    target: Target::Here,
+                    body,
+                })
+                .await?;
+                count.fetch_add(1, Ordering::SeqCst);
+                task.event = Some(id.clone());
+                store.write(&path, &task)?;
+                if let Err(e) = store.link_daily(&path, &task) {
+                    eprintln!("task: could not link it from the daily note: {e:#}");
+                }
+                Ok(format!(
+                    "Posted the task ({id}) and wrote {}. A ✅ reaction or `status: done` closes it.",
+                    path.display()
+                ))
+            }
+            "tasks" => {
+                let store = turn
+                    .tasks
+                    .as_ref()
+                    .context("tasks are not set up here (no tasks.toml)")?;
+                Ok(tasks::list(&store.open()))
+            }
             _ => bail!("unknown tool {tool:?}"),
         }
     }
@@ -488,7 +548,14 @@ that notifies them, with an \"Other\" answer they can type, and gives you \
 the answer. Use it too before something important, risky or hard to \
 undo (deleting, force-pushing, spending money, sending something \
 outside). If nobody answers within ten minutes you are told so; then end \
-your turn: the answer will start a new one.\n";
+your turn: the answer will start a new one.\n\n\
+## Tasks\n\n\
+When a person has to do something only they can do (a manual step, a \
+check, signing in, a switch), give it with the `task` tool instead of \
+writing \"you still need to …\" in a post: it stands out, notifies them, \
+is kept as a note in Kas's vault (listed in the day's AI daily note) and \
+stays open until they tick it off with ✅. One task per call; `tasks` \
+lists the open ones.\n";
 
 /// The final answers that mean "nothing more to post": empty, or a
 /// `[posted]` / `[silent]` marker as the last line. Models often write a
@@ -574,6 +641,24 @@ fn tools() -> Value {
             "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "room": room}, "required": ["id", "text"]}
         },
         {
+            "name": "task",
+            "description": "Give the people in this room a task: something only they can do (a manual step, a check, a decision to act on). It is posted here so it stands out and notifies them, and kept as a note in Kas's Obsidian vault until they tick it off. Use it instead of burying 'you still need to …' in a long post; one task per call.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Short, imperative, in the room's language, e.g. \"Zet Delegate in parley.nix\"."},
+                    "body": {"type": "string", "description": "Markdown: what to do, why, and how to check it is done."},
+                    "due": {"type": "string", "description": "Optional deadline, YYYY-MM-DD."}
+                },
+                "required": ["title", "body"]
+            }
+        },
+        {
+            "name": "tasks",
+            "description": "List the open tasks given to people (in every room), oldest first.",
+            "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
             "name": "approve",
             "description": "Claude Code's permission prompt; parley answers AskUserQuestion with polls. Not for the model.",
             "inputSchema": {"type": "object", "properties": {"tool_name": {"type": "string"}, "input": {"type": "object"}, "tool_use_id": {"type": "string"}}}
@@ -606,7 +691,7 @@ pub fn handle_rpc(msg: &Value, call: &mut CallFn<'_>) -> Option<Value> {
                     Err("`body` is required".to_owned())
                 }
                 "post" | "read" | "rooms" | "schedule" | "schedules" | "cancel" | "handoff"
-                | "approve" => call(name, &args),
+                | "approve" | "task" | "tasks" => call(name, &args),
                 _ => Err(format!("unknown tool {name:?}")),
             };
             let (text, is_error) = match outcome {
@@ -752,6 +837,8 @@ mod tests {
                 "schedules",
                 "cancel",
                 "handoff",
+                "task",
+                "tasks",
                 "approve"
             ]
         );
@@ -839,7 +926,74 @@ mod tests {
             link: crate::agent::Link::default(),
             signer: "Reinout".into(),
             ask: None,
+            tasks: None,
+            people: vec![("@kas:x".into(), "Kas".into())],
         }
+    }
+
+    #[tokio::test]
+    async fn task_posts_here_and_writes_the_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let posts = Arc::new(Posts::default());
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let mut t = turn(got.clone(), Arc::default(), tmp.path());
+        let call = |posts: Arc<Posts>, tok: String, tool: &'static str, args: Value| async move {
+            posts.call(&tok, tool, &args).await
+        };
+        let ticket = posts.register(t.clone()).unwrap();
+        let e = call(
+            posts.clone(),
+            ticket.token.clone(),
+            "task",
+            json!({"title": "x", "body": "y"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.to_string().contains("tasks.toml"));
+        let store = crate::tasks::Store {
+            dir: tmp.path().join("v/tasks"),
+            root: tmp.path().join("v"),
+            vault: "General".into(),
+            daily: None,
+            ai_daily: None,
+        };
+        t.tasks = Some(Arc::new(store.clone()));
+        let ticket = posts.register(t).unwrap();
+        let tok = ticket.token.clone();
+        assert!(
+            call(posts.clone(), tok.clone(), "task", json!({"title": "x"}))
+                .await
+                .is_err()
+        );
+        let out = call(
+            posts.clone(),
+            tok.clone(),
+            "task",
+            json!({"title": "Zet Delegate", "body": "Doe het.", "due": "2026-11-20"}),
+        )
+        .await
+        .unwrap();
+        assert!(out.starts_with("Posted the task ($new)"));
+        assert_eq!(ticket.count(), 1);
+        let sent = got.lock().unwrap().clone();
+        assert_eq!(sent[0].room, "!me:x");
+        assert_eq!(sent[0].target, Target::Here);
+        assert!(sent[0].body.contains("[Kas](https://matrix.to/#/@kas:x)"));
+        assert!(
+            sent[0]
+                .body
+                .contains("obsidian://open?vault=General&file=tasks%2F")
+        );
+        let open = store.open();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].from, "Reinout");
+        assert_eq!(open[0].room, "parley");
+        let list = call(posts.clone(), tok.clone(), "tasks", json!({}))
+            .await
+            .unwrap();
+        assert!(list.contains("Zet Delegate"));
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert!(store.close("!me:x", "$new", &today).unwrap().is_some());
     }
 
     #[test]

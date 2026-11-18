@@ -50,6 +50,7 @@ mod post;
 mod read;
 mod say;
 mod schedule;
+mod tasks;
 mod voice;
 
 use std::{
@@ -80,7 +81,7 @@ use matrix_sdk::{
         api::{client::uiaa, error::ErrorKind},
         events::key::verification::request::ToDeviceKeyVerificationRequestEvent,
         events::poll::unstable_response::OriginalSyncUnstablePollResponseEvent,
-        events::reaction::ReactionEventContent,
+        events::reaction::{OriginalSyncReactionEvent, ReactionEventContent},
         events::relation::{Annotation, Thread},
         events::room::{
             member::StrippedRoomMemberEvent,
@@ -258,6 +259,19 @@ async fn main() -> Result<()> {
         runs: Runs::default(),
         inbox: Inbox::default(),
         asks: Arc::new(ask::Asks::new(config.data_dir.join("rooms"))),
+        tasks: match tasks::Store::load(&config.data_dir) {
+            Ok(t) => {
+                match &t {
+                    Some(t) => println!("tasks: notes in {}", t.dir.display()),
+                    None => println!("tasks: off (no tasks.toml)"),
+                }
+                t.map(Arc::new)
+            }
+            Err(e) => {
+                eprintln!("tasks: {e:#}");
+                None
+            }
+        },
     });
     post::listen(&tooling.socket, tooling.posts.clone())?;
     // Standing clients (clients.rs): the tools for agents outside our runs.
@@ -275,6 +289,7 @@ async fn main() -> Result<()> {
     client.add_event_handler_context(tooling.clone());
     client.add_event_handler(on_message);
     client.add_event_handler(on_vote);
+    client.add_event_handler(on_reaction);
     let allowed = config.allowed.clone();
     client.add_event_handler(
         move |ev: ToDeviceKeyVerificationRequestEvent, client: Client| {
@@ -467,6 +482,8 @@ struct Tooling {
     inbox: Inbox,
     /// Questions asked as polls (ask.rs).
     asks: Arc<ask::Asks>,
+    /// Tasks for people (tasks.rs), if `tasks.toml` sets them up.
+    tasks: Option<Arc<tasks::Store>>,
 }
 
 /// A message, or a schedule's fire, waiting for its conversation's turn.
@@ -731,7 +748,25 @@ async fn tool_turn(
         link: link.clone(),
         signer,
         ask: Some(ask_tool(client, tooling, room, here, reply_to)),
+        tasks: tooling.tasks.clone(),
+        people: people(client, room).await,
     })
+}
+
+/// The people in `room` (joined, not the bot), as (Matrix ID, name).
+async fn people(client: &Client, room: &Room) -> Vec<(String, String)> {
+    let me = client.user_id().map(ToOwned::to_owned);
+    match room.members_no_sync(RoomMemberships::JOIN).await {
+        Ok(members) => members
+            .iter()
+            .filter(|m| Some(m.user_id()) != me.as_deref())
+            .map(|m| (m.user_id().to_string(), m.name().to_owned()))
+            .collect(),
+        Err(e) => {
+            eprintln!("[{}] could not list members: {e}", room.room_id());
+            Vec::new()
+        }
+    }
 }
 
 /// Asking in `room`'s conversation `here` (after `reply_to`): post the
@@ -772,6 +807,37 @@ fn ask_tool(
             asks.wait(room.room_id().as_str(), thread_id, &poll, &q)
         })
     })
+}
+
+/// A ✅ on a task's post (tasks.rs) closes the task.
+async fn on_reaction(
+    ev: OriginalSyncReactionEvent,
+    room: Room,
+    client: Client,
+    Ctx(tooling): Ctx<Arc<Tooling>>,
+) {
+    if room.state() != RoomState::Joined || Some(ev.sender.as_ref()) == client.user_id() {
+        return;
+    }
+    let Some(store) = &tooling.tasks else { return };
+    let key = ev.content.relates_to.key.trim_end_matches('\u{fe0f}');
+    if !matches!(key, "✅" | "✔" | "☑" | "👍") {
+        return;
+    }
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let event = ev.content.relates_to.event_id.as_str();
+    match store.close(room.room_id().as_str(), event, &today) {
+        Ok(Some(title)) => {
+            println!("[{}] {} closed task {title:?}", room.room_id(), ev.sender);
+            // Show it is ticked off where the task was posted.
+            let done = Annotation::new(ev.content.relates_to.event_id.clone(), "🏁".into());
+            if let Err(e) = room.send(ReactionEventContent::new(done)).await {
+                eprintln!("could not mark task {event}: {e}");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("[{}] could not close task {event}: {e:#}", room.room_id()),
+    }
 }
 
 /// A vote on a poll: the answer to a question a run asked (ask.rs). A
@@ -867,6 +933,10 @@ async fn client_tools(
         eprintln!("client {name}: access: {p}");
     }
     let max_depth = agent.max_depth(&home_id).await;
+    let people = match client.get_room(&home_id) {
+        Some(room) => people(client, &room).await,
+        None => Vec::new(),
+    };
     let (send, read) = room_tools(client, agent, home_id, None, None);
     tooling.posts.insert(
         c.token,
@@ -880,6 +950,8 @@ async fn client_tools(
             link: agent::Link::default(),
             signer: name.to_owned(),
             ask: None,
+            tasks: tooling.tasks.clone(),
+            people,
         },
     );
     Ok(())
@@ -1230,6 +1302,8 @@ enum Command {
     Cancel(String),
     /// `!vragen` / `!questions`: the room's open questions (ask.rs).
     Questions,
+    /// `!taken` / `!tasks`: the open tasks for people (tasks.rs).
+    Tasks,
 }
 
 impl Command {
@@ -1245,6 +1319,7 @@ impl Command {
             "!schedules" if arg.is_none() => Some(Self::Schedules),
             "!cancel" => Some(Self::Cancel(rest.to_owned())),
             "!vragen" | "!questions" if arg.is_none() => Some(Self::Questions),
+            "!taken" | "!tasks" if arg.is_none() => Some(Self::Tasks),
             _ => None,
         }
     }
@@ -1312,6 +1387,10 @@ async fn run_command(
                     .join("\n")
             }
         }
+        Command::Tasks => match &tooling.tasks {
+            Some(t) => tasks::list(&t.open()),
+            None => "_Tasks are not set up (no tasks.toml)._".to_owned(),
+        },
     }
 }
 
@@ -1662,6 +1741,8 @@ mod tests {
     #[test]
     fn commands() {
         assert_eq!(Command::parse(" !new "), Some(Command::New));
+        assert_eq!(Command::parse("!taken"), Some(Command::Tasks));
+        assert_eq!(Command::parse("!tasks"), Some(Command::Tasks));
         assert_eq!(Command::parse("!new please"), None);
         assert_eq!(Command::parse("!context"), Some(Command::Context(None)));
         assert_eq!(
