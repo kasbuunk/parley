@@ -14,6 +14,10 @@
 //!   PARLEY_ALLOWED        comma-separated user IDs allowed to invite the bot
 //!   PARLEY_DATA_DIR       default <data dir>/parley
 //!   PARLEY_CLAUDE         the claude program, default `claude`
+//!   PARLEY_MAX_RUNS       agent runs at once over all rooms, default 4
+//!   PARLEY_RUN_MEMORY     memory.max of each run's cgroup, default 6G
+//!   PARLEY_RUN_SWAP       memory.swap.max of each run's cgroup, default 2G
+//!                         (cgroups only with Delegate= on the unit; cgroup.rs)
 //!
 //! `parley say` posts one message as another account and exits (say.rs).
 //!
@@ -38,6 +42,7 @@ mod access;
 mod agent;
 mod ask;
 mod breaker;
+mod cgroup;
 mod clients;
 mod layered;
 mod memory;
@@ -108,6 +113,8 @@ struct Config {
     allowed: Vec<OwnedUserId>,
     data_dir: PathBuf,
     claude: String,
+    max_runs: usize,
+    limits: cgroup::Limits,
 }
 
 impl Config {
@@ -124,6 +131,22 @@ impl Config {
             allowed,
             data_dir,
             claude: env::var("PARLEY_CLAUDE").unwrap_or_else(|_| "claude".into()),
+            max_runs: match env::var("PARLEY_MAX_RUNS") {
+                Ok(n) => n
+                    .parse()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .context("PARLEY_MAX_RUNS: not a positive number")?,
+                Err(_) => 4,
+            },
+            limits: {
+                let d = cgroup::Limits::default();
+                let memory = env::var("PARLEY_RUN_MEMORY").unwrap_or(d.memory);
+                let swap = env::var("PARLEY_RUN_SWAP").unwrap_or(d.swap);
+                cgroup::check_size(&memory).context("PARLEY_RUN_MEMORY")?;
+                cgroup::check_size(&swap).context("PARLEY_RUN_SWAP")?;
+                cgroup::Limits { memory, swap }
+            },
         })
     }
 }
@@ -202,9 +225,26 @@ async fn main() -> Result<()> {
             async move { on_invite(ev, client, room, &allowed).await }
         },
     );
+    // Each run in a cgroup of its own, so oomd or the kernel stops the
+    // run that is too big, not parley (cgroup.rs).
+    let cgroups = match cgroup::Pool::init(config.limits.clone()) {
+        Ok(pool) => {
+            println!(
+                "runs get their own cgroups: {} memory, {} swap, {} at once",
+                config.limits.memory, config.limits.swap, config.max_runs
+            );
+            Some(Arc::new(pool))
+        }
+        Err(e) => {
+            eprintln!("runs share parley's cgroup: {e:#}");
+            None
+        }
+    };
     let agent = Arc::new(Agent::new(
         ClaudeCode {
-            program: config.claude.clone(),
+            cgroups,
+            slots: Arc::new(tokio::sync::Semaphore::new(config.max_runs)),
+            ..ClaudeCode::new(config.claude.clone())
         },
         config.data_dir.join("rooms"),
     ));

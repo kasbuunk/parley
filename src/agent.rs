@@ -260,9 +260,24 @@ pub trait Harness: Send + Sync {
 /// asks questions: whatever the profile does not allow is refused.
 pub struct ClaudeCode {
     pub program: String,
+    /// Where each run gets a cgroup with memory limits (cgroup.rs); `None`
+    /// when parley's cgroup is not delegated to it.
+    pub cgroups: Option<Arc<crate::cgroup::Pool>>,
+    /// At most this many runs at once, over all rooms; the rest wait.
+    pub slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl ClaudeCode {
+    pub fn new(program: String) -> Self {
+        Self {
+            program,
+            cgroups: None,
+            slots: Arc::new(tokio::sync::Semaphore::new(
+                tokio::sync::Semaphore::MAX_PERMITS,
+            )),
+        }
+    }
+
     fn args(run: &Run<'_>) -> Vec<String> {
         let p = run.profile;
         let mut args: Vec<String> = vec!["-p".into(), run.input.into()];
@@ -313,19 +328,66 @@ impl ClaudeCode {
 impl Harness for ClaudeCode {
     async fn run(&self, run: &Run<'_>) -> Result<Output> {
         let timeout = Duration::from_secs(run.profile.timeout_secs);
-        let child = Command::new(&self.program)
+        let _slot = match self.slots.clone().try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(_) => {
+                eprintln!("run in {} waits for a free slot", run.workdir.display());
+                self.slots.clone().acquire_owned().await?
+            }
+        };
+        let scope = match &self.cgroups {
+            Some(pool) => match pool.scope() {
+                Ok(scope) => Some(scope),
+                Err(e) => {
+                    eprintln!("run without its own cgroup: {e:#}");
+                    None
+                }
+            },
+            None => None,
+        };
+        let mut command = Command::new(&self.program);
+        command
             .args(Self::args(run))
             .current_dir(run.workdir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        if let Some(procs) = scope.as_ref().map(|s| s.procs()).transpose()? {
+            // SAFETY: between fork and exec the child only writes "0" to
+            // an already open file (one write(2)); nothing allocates.
+            unsafe {
+                command.pre_exec(move || {
+                    use std::io::Write;
+                    (&procs).write_all(b"0")
+                });
+            }
+        }
+        let child = command
             .spawn()
             .with_context(|| format!("could not start {}", self.program))?;
 
         let output = tokio::time::timeout(timeout, child.wait_with_output())
             .await
-            .with_context(|| format!("no answer within {}s", timeout.as_secs()))??;
+            .with_context(|| format!("no answer within {}s", timeout.as_secs()))
+            .and_then(|done| Ok(done?));
+        let output = match (output, &scope, &self.cgroups) {
+            (Ok(output), _, _) if output.status.success() => output,
+            (result, Some(scope), Some(pool)) if scope.oom_kills() > 0 => {
+                let limits = pool.limits();
+                let detail = match result {
+                    Ok(output) => format!("claude exited with {}", output.status),
+                    Err(e) => format!("{e:#}"),
+                };
+                bail!(
+                    "the run ran out of memory: past its limit of {} (+{} swap), \
+                     the kernel stopped it ({detail})",
+                    limits.memory,
+                    limits.swap
+                );
+            }
+            (result, _, _) => result?,
+        };
 
         #[derive(Deserialize)]
         struct Reply {
@@ -1152,7 +1214,7 @@ mod tests {
     struct Cc(ClaudeCode, Duration);
 
     fn claude(program: String, timeout: Duration) -> Cc {
-        Cc(ClaudeCode { program }, timeout)
+        Cc(ClaudeCode::new(program), timeout)
     }
 
     impl Cc {
@@ -1178,6 +1240,95 @@ mod tests {
                 Err(_) => bail!("no answer within {:?}", self.1),
             }
         }
+    }
+
+    /// A harness whose runs get cgroups in `cg`, a plain folder.
+    fn claude_in(program: String, cg: &Path, slots: usize) -> Cc {
+        let pool = crate::cgroup::Pool::at(cg, Default::default()).unwrap();
+        Cc(
+            ClaudeCode {
+                cgroups: Some(Arc::new(pool)),
+                slots: Arc::new(tokio::sync::Semaphore::new(slots)),
+                ..ClaudeCode::new(program)
+            },
+            Duration::from_secs(10),
+        )
+    }
+
+    #[tokio::test]
+    async fn claude_code_runs_in_a_cgroup_of_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cg = tempfile::tempdir().unwrap();
+        let cc = claude_in(
+            script(tmp.path(), r#"echo '{"result":"hi","is_error":false}'"#),
+            cg.path(),
+            4,
+        );
+        assert_eq!(cc.run("sys", tmp.path(), "x").await.unwrap(), "hi");
+        // The child wrote itself into the run's cgroup before exec.
+        let run = cg.path().join("run-0");
+        assert_eq!(
+            std::fs::read_to_string(run.join("cgroup.procs")).unwrap(),
+            "0"
+        );
+        assert_eq!(
+            std::fs::read_to_string(run.join("memory.max")).unwrap(),
+            "6G"
+        );
+        assert_eq!(
+            std::fs::read_to_string(run.join("cgroup.kill")).unwrap(),
+            "1"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_code_says_when_a_run_ran_out_of_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cg = tempfile::tempdir().unwrap();
+        let events = cg.path().join("run-0/memory.events");
+        let cc = claude_in(
+            script(
+                tmp.path(),
+                &format!(
+                    "printf 'oom 1\\noom_kill 1\\n' > '{}'; exit 137",
+                    events.display()
+                ),
+            ),
+            cg.path(),
+            4,
+        );
+        let err = format!("{:#}", cc.run("sys", tmp.path(), "x").await.unwrap_err());
+        assert!(err.contains("ran out of memory"), "{err}");
+        assert!(err.contains("6G"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn claude_code_runs_wait_for_a_free_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cg = tempfile::tempdir().unwrap();
+        // Each run notes when it starts and ends; with one slot they
+        // must not overlap.
+        let log = tmp.path().join("log");
+        let cc = Arc::new(claude_in(
+            script(
+                tmp.path(),
+                &format!(
+                    "echo start >> '{0}'; sleep 0.3; echo end >> '{0}'; \
+                     echo '{{\"result\":\"hi\",\"is_error\":false}}'",
+                    log.display()
+                ),
+            ),
+            cg.path(),
+            1,
+        ));
+        let dir = tmp.path().to_owned();
+        let (a, b) = tokio::join!(cc.run("sys", &dir, "a"), cc.run("sys", &dir, "b"));
+        assert_eq!(a.unwrap(), "hi");
+        assert_eq!(b.unwrap(), "hi");
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "start\nend\nstart\nend\n"
+        );
     }
 
     #[tokio::test]

@@ -105,6 +105,16 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
   under the turn's first post here (or under a text answer). The viewer
   is agentsview (`~/.config/nixos/modules/agentsview.nix`), which reads
   `~/.claude/projects` live; on in life, nixos, artintel and parley.
+- `src/cgroup.rs`: every Claude Code run in a cgroup of its own. With
+  `Delegate=memory pids` on the unit, parley moves itself to
+  `parley.service/main/` and starts each run in `run-<n>/` with
+  `memory.max` 6G and `memory.swap.max` 2G (`PARLEY_RUN_MEMORY`,
+  `PARLEY_RUN_SWAP`), so the kernel or oomd stops the run that is too
+  big, not parley (15 Nov: oomd killed all of parley). The run's error
+  then says it ran out of memory. When a run ends, what it left running
+  is killed. At most `PARLEY_MAX_RUNS` (4) runs at once over all rooms;
+  the rest wait (a run waiting on a poll holds its place). Without
+  delegation, runs share parley's cgroup (logged at start).
 - `src/breaker.rs`: the circuit breaker (also used for the Matrix sync loop).
 
 ## State on the lab
