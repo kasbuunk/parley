@@ -80,7 +80,11 @@ use matrix_sdk::{
     media::{MediaFormat, MediaRequestParameters},
     ruma::{
         OwnedEventId, OwnedRoomId, OwnedUserId, RoomId,
-        api::{client::uiaa, error::ErrorKind},
+        api::{
+            client::{state::get_state_event_for_key, uiaa},
+            error::ErrorKind,
+        },
+        events::StateEventType,
         events::key::verification::request::ToDeviceKeyVerificationRequestEvent,
         events::poll::unstable_response::OriginalSyncUnstablePollResponseEvent,
         events::reaction::{OriginalSyncReactionEvent, ReactionEventContent},
@@ -223,9 +227,12 @@ async fn main() -> Result<()> {
 
     let allowed = config.allowed.clone();
     client.add_event_handler(
-        move |ev: StrippedRoomMemberEvent, client: Client, room: Room| {
+        move |ev: StrippedRoomMemberEvent,
+              client: Client,
+              room: Room,
+              Ctx(agent): Ctx<Arc<Agent<ClaudeCode>>>| {
             let allowed = allowed.clone();
-            async move { on_invite(ev, client, room, &allowed).await }
+            async move { on_invite(ev, client, room, &allowed, &agent).await }
         },
     );
     // Each run in a cgroup of its own, so oomd or the kernel stops the
@@ -312,6 +319,14 @@ async fn main() -> Result<()> {
         },
     );
 
+    for room in client.joined_rooms() {
+        apply_display_name(&client, &agent, &room).await;
+        // In the log, so a room's name can be checked against the server.
+        match own_member(&client, &room).await {
+            Ok(member) => println!("name in {}: {}", room.room_id(), member["displayname"]),
+            Err(e) => eprintln!("could not read name in {}: {e:#}", room.room_id()),
+        }
+    }
     tokio::spawn(scheduler(client.clone(), agent, tooling));
     println!("listening");
     sync_forever(&client, SyncSettings::default().token(response.next_batch)).await
@@ -457,6 +472,7 @@ async fn on_invite(
     client: Client,
     room: Room,
     allowed: &[OwnedUserId],
+    agent: &Agent<ClaudeCode>,
 ) {
     if ev.state_key != client.user_id().unwrap() {
         return;
@@ -467,9 +483,63 @@ async fn on_invite(
         return;
     }
     match room.join().await {
-        Ok(_) => println!("joined {} (invited by {})", room.room_id(), ev.sender),
+        Ok(_) => {
+            println!("joined {} (invited by {})", room.room_id(), ev.sender);
+            apply_display_name(&client, agent, &room).await;
+        }
         Err(e) => eprintln!("could not join {}: {e}", room.room_id()),
     }
+}
+
+/// Give the bot the name room.toml sets for this room. A failure is only
+/// logged: a room works under the wrong name.
+async fn apply_display_name(client: &Client, agent: &Agent<ClaudeCode>, room: &Room) {
+    let Some(name) = agent.display_name(room.room_id()).await else {
+        return;
+    };
+    match set_display_name(client, room, &name).await {
+        Ok(true) => println!("display name in {} is now {name}", room.room_id()),
+        Ok(false) => {}
+        Err(e) => eprintln!(
+            "warning: could not set display name in {}: {e:#}",
+            room.room_id()
+        ),
+    }
+}
+
+/// Set our name in this room's member event, from the server's current
+/// content so avatar and anything else in it stay. True if it changed.
+async fn set_display_name(client: &Client, room: &Room, name: &str) -> Result<bool> {
+    let me = client.user_id().context("not logged in")?;
+    let Some(content) = renamed_member(own_member(client, room).await?, name) else {
+        return Ok(false);
+    };
+    room.send_state_event_raw("m.room.member", me.as_str(), content)
+        .await?;
+    Ok(true)
+}
+
+/// Our member event's content in this room, as the server has it.
+async fn own_member(client: &Client, room: &Room) -> Result<serde_json::Value> {
+    let me = client.user_id().context("not logged in")?;
+    let response = client
+        .send(get_state_event_for_key::v3::Request::new(
+            room.room_id().to_owned(),
+            StateEventType::RoomMember,
+            me.to_string(),
+        ))
+        .await?;
+    Ok(serde_json::from_str(response.event_or_content.get())?)
+}
+
+/// `content` of a joined member with `displayname` set to `name`; none
+/// when there is nothing to change or we are not joined.
+fn renamed_member(mut content: serde_json::Value, name: &str) -> Option<serde_json::Value> {
+    if content["membership"] != "join" || content["displayname"] == name {
+        return None;
+    }
+    content["displayname"] = name.into();
+    Some(content)
 }
 
 /// What runs need besides the agent: posting tools, schedules, and the
@@ -1540,6 +1610,7 @@ async fn answer(
         }
     };
     // Where to watch the run (`trace` in room.toml), once it starts.
+    apply_display_name(&client, &agent, &room).await;
     let link = agent::Link::default();
     // A `reply = "tool"` room posts (and reads) with tools while it runs.
     let ticket = if agent.replies_with_tool(room.room_id()).await {
@@ -1807,6 +1878,31 @@ fn write_private(path: &PathBuf, contents: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn renaming_keeps_the_rest_of_the_member_event() {
+        let content = serde_json::json!({
+            "membership": "join",
+            "displayname": "agent",
+            "avatar_url": "mxc://lab/a",
+        });
+        assert_eq!(
+            super::renamed_member(content, "Paul"),
+            Some(serde_json::json!({
+                "membership": "join",
+                "displayname": "Paul",
+                "avatar_url": "mxc://lab/a",
+            }))
+        );
+    }
+
+    #[test]
+    fn renaming_skips_a_same_name_or_a_member_who_left() {
+        let same = serde_json::json!({"membership": "join", "displayname": "Paul"});
+        assert_eq!(super::renamed_member(same, "Paul"), None);
+        let left = serde_json::json!({"membership": "leave", "displayname": "agent"});
+        assert_eq!(super::renamed_member(left, "Paul"), None);
+    }
+
     use super::*;
 
     #[test]

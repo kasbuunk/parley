@@ -124,6 +124,10 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
   `/run/parley-<user>` that accepts only its token. No `image`, `task`,
   `tasks`, trace link or transcript path. It fails closed: no sudo, no
   wrapper or no cgroup means no run.
+- `display_name = "Paul"` in room.toml: the bot's name in that room only
+  (its `m.room.member` event, keeping avatar and the rest; the global
+  profile stays `agent`). Applied at start, on joining and at each turn,
+  only when it differs; a failure is logged and the room goes on.
 - `src/breaker.rs`: the circuit breaker (also used for the Matrix sync loop).
 
 ## State on the lab

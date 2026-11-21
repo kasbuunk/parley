@@ -125,6 +125,9 @@ pub struct Profile {
     /// Run the harness as this Linux user, through sudo and its wrapper,
     /// with a cleared environment (see `confine.rs`). Fails closed.
     pub run_as: Option<String>,
+    /// The bot's name in this room only (its `m.room.member` event). The
+    /// account's global profile stays as it is.
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -190,6 +193,7 @@ impl Default for Profile {
             voice: crate::voice::Voice::Reply,
             trace: None,
             run_as: None,
+            display_name: None,
         }
     }
 }
@@ -870,6 +874,16 @@ impl<H: Harness> Agent<H> {
     pub async fn run_as(&self, room_id: &RoomId) -> Option<String> {
         let dir = self.room_dir(room_id).ok()?;
         Self::profile(&dir).await.ok()?.run_as
+    }
+
+    /// The bot's name in this room (`display_name`), if it has its own.
+    pub async fn display_name(&self, room_id: &RoomId) -> Option<String> {
+        let dir = self.room_dir(room_id).ok()?;
+        Self::profile(&dir)
+            .await
+            .ok()?
+            .display_name
+            .filter(|n| !n.trim().is_empty())
     }
 
     pub async fn replies_with_tool(&self, room_id: &RoomId) -> bool {
