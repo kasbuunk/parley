@@ -44,6 +44,7 @@ mod ask;
 mod breaker;
 mod cgroup;
 mod clients;
+mod image;
 mod layered;
 mod memory;
 mod post;
@@ -738,9 +739,14 @@ async fn tool_turn(
         },
         None => "agent".to_owned(),
     };
+    let image = agent
+        .reads_files(room.room_id())
+        .await
+        .then(|| image_tool(client, agent, room.room_id().to_owned(), here, reply_to));
     Ok(post::Turn {
         access,
         send,
+        image,
         read,
         schedules: tooling.schedules.clone(),
         depth,
@@ -937,12 +943,14 @@ async fn client_tools(
         Some(room) => people(client, &room).await,
         None => Vec::new(),
     };
-    let (send, read) = room_tools(client, agent, home_id, None, None);
+    let (send, read) = room_tools(client, agent, home_id.clone(), None, None);
+    let image = image_tool(client, agent, home_id, &None, &None);
     tooling.posts.insert(
         c.token,
         post::Turn {
             access,
             send,
+            image: Some(image),
             read,
             schedules: tooling.schedules.clone(),
             depth: 0,
@@ -1010,6 +1018,89 @@ fn room_tools(
     });
     (send, read)
 }
+
+/// The `image` tool of a turn whose own room is `home`. Only to encrypted
+/// rooms: an image may be a secret, like a VPN tunnel's QR code.
+fn image_tool(
+    client: &Client,
+    agent: &Arc<Agent<ClaudeCode>>,
+    home: OwnedRoomId,
+    here: &Option<OwnedEventId>,
+    reply_to: &Option<OwnedEventId>,
+) -> post::ImageFn {
+    use matrix_sdk::{
+        attachment::{AttachmentConfig, AttachmentInfo, BaseImageInfo},
+        room::reply::{EnforceThread, Reply},
+        ruma::{
+            UInt,
+            events::room::message::{AddMentions, ReplyWithinThread, TextMessageEventContent},
+        },
+    };
+    let (c, agent, here, reply_to) = (
+        client.clone(),
+        agent.clone(),
+        here.clone(),
+        reply_to.clone(),
+    );
+    Arc::new(move |p: post::ImagePost| {
+        let (c, agent, here, reply_to, home) = (
+            c.clone(),
+            agent.clone(),
+            here.clone(),
+            reply_to.clone(),
+            home.clone(),
+        );
+        Box::pin(async move {
+            let room = joined(&c, &p.room)?;
+            if !room.latest_encryption_state().await?.is_encrypted() {
+                bail!("this room is not encrypted; images are only posted to encrypted rooms");
+            }
+            // The thread it goes in, and the event that places it there.
+            let (thread, anchor) = match &p.target {
+                post::Target::Here if room.room_id() == home => (
+                    here.clone(),
+                    here.as_ref()
+                        .map(|root| reply_to.clone().unwrap_or(root.clone())),
+                ),
+                post::Target::Thread(t) => {
+                    let root = OwnedEventId::try_from(t.as_str()).context("bad thread ID")?;
+                    (Some(root.clone()), Some(root))
+                }
+                _ => (None, None),
+            };
+            let mime: mime::Mime = p.image.mimetype.parse().context("bad image type")?;
+            let info = BaseImageInfo {
+                width: p.image.size.map(|s| UInt::from(s.0)),
+                height: p.image.size.map(|s| UInt::from(s.1)),
+                size: UInt::new(p.image.data.len() as u64),
+                ..Default::default()
+            };
+            let mut config = AttachmentConfig::new()
+                .info(AttachmentInfo::Image(info))
+                .caption(p.caption.as_deref().map(TextMessageEventContent::markdown));
+            if let Some(event_id) = anchor {
+                config = config.reply(Some(Reply {
+                    event_id,
+                    enforce_thread: EnforceThread::Threaded(ReplyWithinThread::No),
+                    add_mentions: AddMentions::No,
+                }));
+            }
+            let note = match &p.caption {
+                Some(c) => format!("[image: {}] {c}", p.image.filename),
+                None => format!("[image: {}]", p.image.filename),
+            };
+            let sent = room
+                .send_attachment(p.image.filename, &mime, p.image.data, config)
+                .await?;
+            let thread = thread.as_ref().map(|t| t.as_str());
+            if let Err(e) = agent.record(room.room_id(), thread, "agent", &note).await {
+                eprintln!("could not write transcript: {e}");
+            }
+            Ok(sent.event_id.to_string())
+        })
+    })
+}
+
 /// The joined room with this ID.
 fn joined(client: &Client, id: &str) -> Result<Room> {
     let id: &RoomId = id.try_into().context("bad room ID")?;

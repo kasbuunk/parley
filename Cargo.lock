@@ -2252,6 +2252,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "matrix-sdk",
+ "mime",
  "serde",
  "serde_json",
  "tempfile",

@@ -809,6 +809,15 @@ impl<H: Harness> Agent<H> {
         }
     }
 
+    /// Whether this room's runs can read files themselves; only then may
+    /// they post one with the `image` tool.
+    pub async fn reads_files(&self, room_id: &RoomId) -> bool {
+        match self.room_dir(room_id) {
+            Ok(dir) => tools_read_files(&Self::profile(&dir).await.unwrap_or_default().tools),
+            Err(_) => false,
+        }
+    }
+
     pub async fn replies_with_tool(&self, room_id: &RoomId) -> bool {
         match self.room_dir(room_id) {
             Ok(dir) => Self::profile(&dir)
@@ -1173,9 +1182,25 @@ async fn read_summaries(dir: &Path, prefix: &str) -> HashMap<String, String> {
     out
 }
 
+/// Whether a `tools` setting lets a run read files.
+fn tools_read_files(tools: &str) -> bool {
+    tools
+        .split(',')
+        .any(|t| matches!(t.trim(), "default" | "Read" | "Bash"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn which_tools_read_files() {
+        assert!(tools_read_files("default"));
+        assert!(tools_read_files("Grep, Read"));
+        assert!(tools_read_files("Bash"));
+        assert!(!tools_read_files(""));
+        assert!(!tools_read_files("WebSearch"));
+    }
     use std::{collections::VecDeque, time::Instant};
 
     use anyhow::anyhow;

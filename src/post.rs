@@ -73,6 +73,18 @@ pub struct Post {
 type Future_<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// Sends a post; returns the new event's ID.
 pub type SendFn = Arc<dyn Fn(Post) -> Future_<Result<String>> + Send + Sync>;
+/// An image to post (the `image` tool).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImagePost {
+    /// The room's ID.
+    pub room: String,
+    pub target: Target,
+    pub image: crate::image::Loaded,
+    pub caption: Option<String>,
+}
+
+/// Sends an image; returns the new event's ID.
+pub type ImageFn = Arc<dyn Fn(ImagePost) -> Future_<Result<String>> + Send + Sync>;
 /// Reads a page of a room (by ID).
 pub type ReadFn = Arc<dyn Fn(String, read::Query) -> Future_<Result<read::Page>> + Send + Sync>;
 
@@ -81,6 +93,9 @@ pub type ReadFn = Arc<dyn Fn(String, read::Query) -> Future_<Result<read::Page>>
 pub struct Turn {
     pub access: Access,
     pub send: SendFn,
+    /// Posts an image. None where the run may not read files itself, so
+    /// the tool cannot widen what a confined room's agent can get at.
+    pub image: Option<ImageFn>,
     pub read: ReadFn,
     /// Where the `schedule` tools keep their schedules.
     pub schedules: Arc<schedule::Store>,
@@ -224,6 +239,51 @@ impl Posts {
                 let id = (turn.send)(Post { room, target, body }).await?;
                 count.fetch_add(1, Ordering::SeqCst);
                 Ok(format!("Posted ({id})."))
+            }
+            "image" => {
+                let send = turn
+                    .image
+                    .as_ref()
+                    .context("this room's agent may not read files, so it cannot post them")?;
+                let path = s("path").context("`path` is required")?;
+                let room = a.room(s("room"))?;
+                let target = match Target::parse(s("thread"))? {
+                    Target::Here if room != a.here => Target::Main,
+                    t => t,
+                };
+                let scope = match &target {
+                    Target::Here => a.here_scope.clone(),
+                    Target::Main => Scope::Main,
+                    Target::Thread(t) => Scope::Thread(t.clone()),
+                };
+                a.check(&room, &scope, true)?;
+                let image = crate::image::load(path).await?;
+                let mut caption = s("caption")
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_owned);
+                if room == a.here
+                    && target == Target::Here
+                    && let Some(link) = turn.link.lock().unwrap().take()
+                {
+                    caption = Some(match caption {
+                        Some(c) => format!("{c}\n\n{link}"),
+                        None => link,
+                    });
+                }
+                if room != a.here {
+                    let c = caption.unwrap_or_else(|| image.filename.clone());
+                    caption = Some(sign(&c, &turn.signer, &a.here_name()));
+                }
+                let id = send(ImagePost {
+                    room,
+                    target,
+                    image,
+                    caption,
+                })
+                .await?;
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(format!("Posted the image ({id})."))
             }
             "read" => {
                 let room = a.room(s("room"))?;
@@ -523,6 +583,12 @@ returns a page, newest first unless `order: \"oldest\"`, filtered by \
 (YYYY-MM-DD or unix seconds), `sender` and `contains`, with a cursor for \
 the next page. Use it when the past matters instead of guessing. `post` \
 takes a `room` too.\n\n\
+## Images\n\n\
+The `image` tool posts an image file (PNG, JPEG, GIF, WebP) from this \
+machine, for what is better seen than read, such as a QR code to scan. It \
+works only in encrypted rooms. Everyone in the room can see it and it stays \
+in the history, so post an image holding a secret only when the person it \
+is for asked for it, and only in a room with no one else.\n\n\
 ## Other rooms\n\n\
 Where `rooms` says you may post, you may do what Kas would otherwise do \
 for you there: when work belongs in another room, hand it over yourself \
@@ -581,6 +647,20 @@ fn tools() -> Value {
                     "room": room,
                 },
                 "required": ["body"]
+            }
+        },
+        {
+            "name": "image",
+            "description": "Post an image file from this machine (PNG, JPEG, GIF or WebP, at most 10 MB) to an encrypted Matrix room, end-to-end encrypted. By default it goes to the conversation this turn answers. Returns the new event's ID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path of the image."},
+                    "caption": {"type": "string", "description": "Optional text with the image, in Markdown."},
+                    "thread": {"type": "string", "description": "Omit for this conversation (in another room: its main timeline); \"main\" for the main timeline; or a thread's root event ID."},
+                    "room": room,
+                },
+                "required": ["path"]
             }
         },
         {
@@ -690,13 +770,13 @@ pub fn handle_rpc(msg: &Value, call: &mut CallFn<'_>) -> Option<Value> {
                 "post" if args.get("body").and_then(Value::as_str).is_none() => {
                     Err("`body` is required".to_owned())
                 }
-                "post" | "read" | "rooms" | "schedule" | "schedules" | "cancel" | "handoff"
-                | "approve" | "task" | "tasks" => call(name, &args),
+                "post" | "image" | "read" | "rooms" | "schedule" | "schedules" | "cancel"
+                | "handoff" | "approve" | "task" | "tasks" => call(name, &args),
                 _ => Err(format!("unknown tool {name:?}")),
             };
             let (text, is_error) = match outcome {
                 Ok(t) => (t, false),
-                Err(e) if name == "post" => (format!("Not posted: {e}"), true),
+                Err(e) if name == "post" || name == "image" => (format!("Not posted: {e}"), true),
                 Err(e) => (format!("Failed: {e}"), true),
             };
             json!({"content": [{"type": "text", "text": text}], "isError": is_error})
@@ -831,6 +911,7 @@ mod tests {
             names,
             [
                 "post",
+                "image",
                 "read",
                 "rooms",
                 "schedule",
@@ -910,6 +991,7 @@ mod tests {
                 got.lock().unwrap().push(p);
                 Box::pin(async { Ok("$new".to_owned()) })
             }),
+            image: None,
             read: Arc::new(move |room, q| {
                 reads.lock().unwrap().push((room, q));
                 Box::pin(async {
