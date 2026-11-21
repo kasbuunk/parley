@@ -122,6 +122,9 @@ pub struct Profile {
     /// Claude Code session file, and its first post here links to
     /// `<trace>/sessions/<session id>`, so a run can be followed live.
     pub trace: Option<String>,
+    /// Run the harness as this Linux user, through sudo and its wrapper,
+    /// with a cleared environment (see `confine.rs`). Fails closed.
+    pub run_as: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -186,6 +189,7 @@ impl Default for Profile {
             max_depth: 10,
             voice: crate::voice::Voice::Reply,
             trace: None,
+            run_as: None,
         }
     }
 }
@@ -260,6 +264,8 @@ pub trait Harness: Send + Sync {
 /// asks questions: whatever the profile does not allow is refused.
 pub struct ClaudeCode {
     pub program: String,
+    /// The sudo that starts a `run_as` room's runs.
+    pub sudo: String,
     /// Where each run gets a cgroup with memory limits (cgroup.rs); `None`
     /// when parley's cgroup is not delegated to it.
     pub cgroups: Option<Arc<crate::cgroup::Pool>>,
@@ -271,6 +277,7 @@ impl ClaudeCode {
     pub fn new(program: String) -> Self {
         Self {
             program,
+            sudo: crate::confine::SUDO.to_owned(),
             cgroups: None,
             slots: Arc::new(tokio::sync::Semaphore::new(
                 tokio::sync::Semaphore::MAX_PERMITS,
@@ -280,7 +287,11 @@ impl ClaudeCode {
 
     fn args(run: &Run<'_>) -> Vec<String> {
         let p = run.profile;
-        let mut args: Vec<String> = vec!["-p".into(), run.input.into()];
+        let mut args: Vec<String> = vec!["-p".into()];
+        // A `run_as` run gets its input on stdin: sudo logs the arguments.
+        if p.run_as.is_none() {
+            args.push(run.input.into());
+        }
         args.push(match p.prompt {
             PromptMode::Replace => "--system-prompt".into(),
             PromptMode::Append => "--append-system-prompt".into(),
@@ -345,11 +356,32 @@ impl Harness for ClaudeCode {
             },
             None => None,
         };
-        let mut command = Command::new(&self.program);
+        let run_as = run.profile.run_as.as_deref();
+        let mut command = match run_as {
+            Some(user) => {
+                crate::confine::check_user(user)?;
+                // Its limits must hold, and only the cgroup can stop a
+                // process that runs under root's sudo.
+                if scope.is_none() {
+                    bail!("not running as {user}: this run has no cgroup of its own");
+                }
+                let mut c = Command::new(&self.sudo);
+                c.args(["-n", "-u", user])
+                    .arg(crate::confine::wrapper(user))
+                    .env_clear()
+                    // The wrapper picks the working directory.
+                    .current_dir("/")
+                    .stdin(Stdio::piped());
+                c
+            }
+            None => {
+                let mut c = Command::new(&self.program);
+                c.current_dir(run.workdir).stdin(Stdio::null());
+                c
+            }
+        };
         command
             .args(Self::args(run))
-            .current_dir(run.workdir)
-            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -363,9 +395,20 @@ impl Harness for ClaudeCode {
                 });
             }
         }
-        let child = command
-            .spawn()
-            .with_context(|| format!("could not start {}", self.program))?;
+        let mut child = command.spawn().with_context(|| match run_as {
+            Some(user) => format!("could not start the run as {user}"),
+            None => format!("could not start {}", self.program),
+        })?;
+        if run_as.is_some()
+            && let Some(mut stdin) = child.stdin.take()
+        {
+            let input = run.input.to_owned();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                // If it fails, the run has died and reports that itself.
+                let _ = stdin.write_all(input.as_bytes()).await;
+            });
+        }
 
         let output = tokio::time::timeout(timeout, child.wait_with_output())
             .await
@@ -678,10 +721,12 @@ impl<H: Harness> Agent<H> {
         let (out_dir, prefix) = summaries_of(&dir, &profile);
         let name = profile.name.as_deref().unwrap_or(room_id.as_str());
         tokio::fs::create_dir_all(&out_dir).await?;
-        // Locked down and small: it only writes text.
+        // Locked down and small: it only writes text. As the room's own
+        // user, so nothing of a `run_as` room runs as parley's.
         let small = Profile {
             model: Some("haiku".into()),
             timeout_secs: 120,
+            run_as: profile.run_as.clone(),
             ..Profile::default()
         };
         loop {
@@ -720,10 +765,13 @@ impl<H: Harness> Agent<H> {
         let file = dir.join("MEMORY.md");
         let notes = tokio::fs::read_to_string(&file).await.ok();
         let input = memory::digest_input(notes.as_deref(), &ex.sender, &ex.body, &ex.answer);
-        // Locked down and small: it only rewrites text.
+        // Locked down and small: it only rewrites text. As the room's own
+        // user, so nothing of a `run_as` room runs as parley's.
+        let run_as = Self::profile(&dir).await?.run_as;
         let profile = Profile {
             model: Some("haiku".into()),
             timeout_secs: 120,
+            run_as,
             ..Profile::default()
         };
         let out = self
@@ -816,6 +864,12 @@ impl<H: Harness> Agent<H> {
             Ok(dir) => tools_read_files(&Self::profile(&dir).await.unwrap_or_default().tools),
             Err(_) => false,
         }
+    }
+
+    /// The Linux user the room's runs start as (`run_as`), if any.
+    pub async fn run_as(&self, room_id: &RoomId) -> Option<String> {
+        let dir = self.room_dir(room_id).ok()?;
+        Self::profile(&dir).await.ok()?.run_as
     }
 
     pub async fn replies_with_tool(&self, room_id: &RoomId) -> bool {
@@ -969,6 +1023,14 @@ impl<H: Harness> Agent<H> {
         tokio::fs::create_dir_all(&dir).await?;
 
         let profile = Self::profile(&dir).await?;
+        if let Some(user) = &profile.run_as {
+            crate::confine::check_user(user)?;
+            // Parley could not enter a folder of that user, and Claude
+            // Code files sessions by folder: the wrapper keeps it fixed.
+            if profile.workdir.is_some() {
+                bail!("room.toml: `workdir` cannot be combined with `run_as`");
+            }
+        }
 
         // Fail closed: a capable room stops working as soon as someone
         // who is not on its list is in it.
@@ -997,6 +1059,10 @@ impl<H: Harness> Agent<H> {
         let system_prompt = match mcp_config {
             Some(_) => system_prompt + crate::post::PROMPT_NOTE,
             None => system_prompt,
+        };
+        let system_prompt = match (&profile.run_as, mcp_config) {
+            (Some(_), Some(_)) => system_prompt + crate::confine::PROMPT_NOTE,
+            _ => system_prompt,
         };
 
         let (mode, _) = Self::mode(&dir, &profile).await?;
@@ -1039,7 +1105,12 @@ impl<H: Harness> Agent<H> {
                     n,
                     layered::day_of(now()),
                     &have,
-                    &path.display().to_string(),
+                    // A `run_as` user cannot read this file.
+                    profile
+                        .run_as
+                        .is_none()
+                        .then(|| path.display().to_string())
+                        .as_deref(),
                     &message,
                 )
             }
@@ -1047,12 +1118,13 @@ impl<H: Harness> Agent<H> {
         let workdir = profile.workdir.clone().unwrap_or_else(|| dir.clone());
         // With a session viewer, name a new session up front and say where
         // to watch it; Claude Code keeps the ID when it resumes one.
-        let new_session = match (&profile.trace, &session) {
+        // The viewer reads parley's user's sessions, not a `run_as` user's.
+        let trace = profile.trace.as_ref().filter(|_| profile.run_as.is_none());
+        let new_session = match (trace, &session) {
             (Some(_), None) => Some(new_session_id()?),
             _ => None,
         };
-        if let (Some(base), Some(id)) = (&profile.trace, session.as_ref().or(new_session.as_ref()))
-        {
+        if let (Some(base), Some(id)) = (trace, session.as_ref().or(new_session.as_ref())) {
             *link.lock().unwrap() = Some(trace_link(base, id));
         }
         let run = Run {
@@ -1062,7 +1134,7 @@ impl<H: Harness> Agent<H> {
             input: &input,
             session: session.as_deref(),
             new_session: new_session.as_deref(),
-            persist: mode.resumes() || profile.trace.is_some(),
+            persist: mode.resumes() || trace.is_some(),
             mcp_config,
         };
         match self.harness.run(&run).await {
@@ -1304,6 +1376,129 @@ mod tests {
             std::fs::read_to_string(run.join("cgroup.kill")).unwrap(),
             "1"
         );
+    }
+
+    /// One `run_as` run through a fake sudo, with the real `claude` a
+    /// script that leaves a mark if it is ever started.
+    async fn run_as_paul(sudo_body: &str, tmp: &Path, cg: &Path) -> Result<Output> {
+        let bin = tmp.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let sudo = script(&bin, sudo_body);
+        let cc = ClaudeCode {
+            sudo,
+            ..claude_in(
+                script(tmp, &format!("touch {}/fell-back", tmp.display())),
+                cg,
+                4,
+            )
+            .0
+        };
+        let profile = Profile {
+            timeout_secs: 10,
+            run_as: Some("paul".into()),
+            ..Profile::default()
+        };
+        cc.run(&Run {
+            profile: &profile,
+            system_prompt: "sys",
+            workdir: tmp,
+            input: "the secret message",
+            session: None,
+            new_session: None,
+            persist: false,
+            mcp_config: Some("/run/parley-paul/run-x.json"),
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn run_as_goes_through_sudo_with_nothing_of_parley() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cg = tempfile::tempdir().unwrap();
+        let out = tmp.path().display().to_string();
+        let body = format!(
+            "printf '%s\\n' \"$@\" > {out}/args\n\
+             export -p > {out}/env\n\
+             pwd > {out}/pwd\n\
+             IFS= read -r line\n\
+             printf '%s' \"$line\" > {out}/stdin\n\
+             echo '{{\"result\":\"hi\",\"is_error\":false}}'"
+        );
+        // Cargo sets this for the test process; the child must not get it.
+        assert!(std::env::var_os("CARGO_MANIFEST_DIR").is_some());
+        let reply = run_as_paul(&body, tmp.path(), cg.path()).await.unwrap();
+        assert_eq!(reply.text, "hi");
+
+        let read = |f: &str| std::fs::read_to_string(tmp.path().join(f)).unwrap();
+        let args = read("args");
+        let args: Vec<&str> = args.lines().collect();
+        assert_eq!(
+            args[..5],
+            [
+                "-n",
+                "-u",
+                "paul",
+                "/run/current-system/sw/bin/paul-claude",
+                "-p"
+            ]
+        );
+        assert!(!args.contains(&"the secret message"), "{args:?}");
+        assert!(args.contains(&"/run/parley-paul/run-x.json"), "{args:?}");
+        assert_eq!(read("stdin"), "the secret message");
+        assert_eq!(read("pwd").trim(), "/");
+        assert!(!read("env").contains("CARGO_MANIFEST_DIR"));
+        // Limits still apply: the child joined the run's cgroup.
+        assert_eq!(
+            std::fs::read_to_string(cg.path().join("run-0/cgroup.procs")).unwrap(),
+            "0"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_as_fails_closed_when_sudo_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cg = tempfile::tempdir().unwrap();
+        let e = run_as_paul(
+            "echo 'a password is required' >&2; exit 1",
+            tmp.path(),
+            cg.path(),
+        )
+        .await
+        .err()
+        .expect("the run must fail");
+        assert!(format!("{e:#}").contains("a password is required"), "{e:#}");
+        assert!(!tmp.path().join("fell-back").exists());
+    }
+
+    #[tokio::test]
+    async fn run_as_needs_a_cgroup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mark = tmp.path().join("started");
+        let sudo = script(tmp.path(), &format!("touch {}", mark.display()));
+        let cc = ClaudeCode {
+            sudo,
+            ..ClaudeCode::new("/bin/false".into())
+        };
+        let profile = Profile {
+            run_as: Some("paul".into()),
+            ..Profile::default()
+        };
+        let e = cc
+            .run(&Run {
+                profile: &profile,
+                system_prompt: "sys",
+                workdir: tmp.path(),
+                input: "x",
+                session: None,
+                new_session: None,
+                persist: false,
+                mcp_config: None,
+            })
+            .await
+            .err()
+            .expect("the run must fail");
+        assert!(format!("{e:#}").contains("no cgroup"), "{e:#}");
+        assert!(!mark.exists());
     }
 
     #[tokio::test]

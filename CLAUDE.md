@@ -115,6 +115,15 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
   is killed. At most `PARLEY_MAX_RUNS` (4) runs at once over all rooms;
   the rest wait (a run waiting on a poll holds its place). Without
   delegation, runs share parley's cgroup (logged at start).
+- `src/confine.rs`: `run_as = "<user>"` in room.toml runs the room's
+  harness (summaries and digests too) as that Linux user:
+  `sudo -n -u <user> /run/current-system/sw/bin/<user>-claude <args>`,
+  cleared env, cwd `/` (the wrapper picks the workdir, so `workdir` is
+  refused). The message goes over stdin and the MCP config is a file, so
+  neither is in sudo's log. Each turn gets its own socket in
+  `/run/parley-<user>` that accepts only its token. No `image`, `task`,
+  `tasks`, trace link or transcript path. It fails closed: no sudo, no
+  wrapper or no cgroup means no run.
 - `src/breaker.rs`: the circuit breaker (also used for the Matrix sync loop).
 
 ## State on the lab

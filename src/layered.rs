@@ -343,7 +343,7 @@ pub fn input(
     recent: usize,
     today: i64,
     have: &HashMap<String, String>,
-    transcript_path: &str,
+    transcript_path: Option<&str>,
     message: &str,
 ) -> String {
     let mut out = String::new();
@@ -372,11 +372,20 @@ pub fn input(
         out.push_str(&past.join("\n\n"));
         out.push('\n');
     }
+    // A run as another user cannot read the transcript: no path for it.
+    let source = match transcript_path {
+        Some(path) => format!(
+            "Everything said in this room is in {path} (one JSON object per \
+             line: ts, sender, thread, body). When the past matters more than \
+             these notes show, look it up there, or in any other source you \
+             can reach, rather than guessing."
+        ),
+        None => "When the past matters more than these notes show, look it up \
+                 with the `read` tool, if you have it, rather than guessing."
+            .to_owned(),
+    };
     out.push_str(&format!(
-        "\nToday is {} ({}). Everything said in this room is in {transcript_path} \
-         (one JSON object per line: ts, sender, thread, body). When the past \
-         matters more than these notes show, look it up there, or in any other \
-         source you can reach, rather than guessing.\n</room-history>\n\n",
+        "\nToday is {} ({}). {source}\n</room-history>\n\n",
         date(today),
         weekday(today)
     ));
@@ -511,7 +520,15 @@ mod tests {
             ("2026-W39".to_owned(), "- the week".to_owned()),
             ("2026-10-27".to_owned(), "- yesterday's gist".to_owned()),
         ]);
-        let i = input(&msgs, Some("$t"), 1, today, &have, "/r/t.jsonl", "[Kas] q");
+        let i = input(
+            &msgs,
+            Some("$t"),
+            1,
+            today,
+            &have,
+            Some("/r/t.jsonl"),
+            "[Kas] q",
+        );
         assert!(i.starts_with("<room-history>\n"), "{i}");
         assert!(
             i.contains(
@@ -541,7 +558,7 @@ mod tests {
             2,
             today,
             &HashMap::new(),
-            "/r/t.jsonl",
+            Some("/r/t.jsonl"),
             "[Kas] q",
         );
         assert!(
@@ -585,6 +602,13 @@ mod tests {
     }
 
     #[test]
+    fn without_a_path_it_points_at_the_read_tool() {
+        let i = input(&[], None, 5, MON, &HashMap::new(), None, "[Kas] hi");
+        assert!(!i.contains("transcript") && !i.contains("jsonl"), "{i}");
+        assert!(i.contains("`read` tool"), "{i}");
+    }
+
+    #[test]
     fn empty_room_still_points_at_the_transcript() {
         let i = input(
             &[],
@@ -592,7 +616,7 @@ mod tests {
             5,
             MON,
             &HashMap::new(),
-            "/r/t.jsonl",
+            Some("/r/t.jsonl"),
             "[Kas] hi",
         );
         assert!(i.contains("No earlier days"));
@@ -609,7 +633,7 @@ mod tests {
             msgs.push(msg(at(MON, 1), "agent", Some("$t"), &big));
         }
         msgs.push(msg(at(MON, 2), "agent", Some("$t"), "last"));
-        let i = input(&msgs, Some("$t"), 0, MON, &HashMap::new(), "/t", "q");
+        let i = input(&msgs, Some("$t"), 0, MON, &HashMap::new(), Some("/t"), "q");
         assert!(i.contains("so far:\n\n[kas] root\n\n"), "{}", &i[..300]);
         assert!(i.contains("[agent] last\n</this-thread>"));
         assert!(i.len() < MAX_THREAD_CHARS + 2_000, "{}", i.len());

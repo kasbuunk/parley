@@ -44,6 +44,7 @@ mod ask;
 mod breaker;
 mod cgroup;
 mod clients;
+mod confine;
 mod image;
 mod layered;
 mod memory;
@@ -739,9 +740,10 @@ async fn tool_turn(
         },
         None => "agent".to_owned(),
     };
-    let image = agent
-        .reads_files(room.room_id())
-        .await
+    // These two act with parley's own rights on the machine: `image` reads
+    // any path, `tasks` lists Kas's notes. Not for a run as another user.
+    let run_as = agent.run_as(room.room_id()).await;
+    let image = (run_as.is_none() && agent.reads_files(room.room_id()).await)
         .then(|| image_tool(client, agent, room.room_id().to_owned(), here, reply_to));
     Ok(post::Turn {
         access,
@@ -754,7 +756,7 @@ async fn tool_turn(
         link: link.clone(),
         signer,
         ask: Some(ask_tool(client, tooling, room, here, reply_to)),
-        tasks: tooling.tasks.clone(),
+        tasks: tooling.tasks.clone().filter(|_| run_as.is_none()),
         people: people(client, room).await,
     })
 }
@@ -1556,9 +1558,31 @@ async fn answer(
     } else {
         None
     };
-    let mcp_config = ticket
-        .as_ref()
-        .map(|t| post::mcp_config(&tooling.exe, &tooling.socket, &t.token));
+    // A room with `run_as` gets a socket of its own for this turn, never
+    // the main one; without it the turn does not run.
+    let run_tools = match (&ticket, agent.run_as(room.room_id()).await) {
+        (Some(t), Some(user)) => {
+            let made = confine::run_dir(&user).and_then(|dir| {
+                confine::RunTools::create(&dir, &tooling.exe, tooling.posts.clone(), &t.token)
+            });
+            match made {
+                Ok(tools) => Some(tools),
+                Err(e) => {
+                    eprintln!("[{}] no tools for {user}: {e:#}", room.room_id());
+                    let text = format!("_Not running as {user}: {e:#}_");
+                    send_text(&room, text, thread.as_ref(), reply_to.as_ref()).await;
+                    return;
+                }
+            }
+        }
+        _ => None,
+    };
+    let mcp_config = match &run_tools {
+        Some(tools) => Some(tools.config_arg()),
+        None => ticket
+            .as_ref()
+            .map(|t| post::mcp_config(&tooling.exe, &tooling.socket, &t.token)),
+    };
     let answer = agent
         .reply_with(
             room.room_id(),

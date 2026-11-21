@@ -483,7 +483,7 @@ async fn approve(turn: &Turn, args: &Value) -> Result<String> {
     Ok(allow(ask::answered(&input, &answers)))
 }
 
-fn random_token() -> Result<String> {
+pub fn random_token() -> Result<String> {
     use std::io::Read;
     let mut buf = [0u8; 16];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
@@ -511,6 +511,16 @@ pub fn listen(path: &Path, posts: Arc<Posts>) -> Result<()> {
 }
 
 pub async fn serve(listener: tokio::net::UnixListener, posts: Arc<Posts>) {
+    serve_only(listener, posts, None).await
+}
+
+/// [`serve`] for one turn of a `run_as` room (confine.rs): any other token,
+/// even a live one, is refused on this socket.
+pub async fn serve_token(listener: tokio::net::UnixListener, posts: Arc<Posts>, token: String) {
+    serve_only(listener, posts, Some(Arc::from(token))).await
+}
+
+async fn serve_only(listener: tokio::net::UnixListener, posts: Arc<Posts>, only: Option<Arc<str>>) {
     loop {
         let stream = match listener.accept().await {
             Ok((s, _)) => s,
@@ -521,6 +531,7 @@ pub async fn serve(listener: tokio::net::UnixListener, posts: Arc<Posts>) {
             }
         };
         let posts = posts.clone();
+        let only = only.clone();
         tokio::spawn(async move {
             let (read, mut write) = stream.into_split();
             let mut line = String::new();
@@ -531,7 +542,7 @@ pub async fn serve(listener: tokio::net::UnixListener, posts: Arc<Posts>) {
             {
                 return;
             }
-            let answer = match handle_request(&posts, &line).await {
+            let answer = match handle_request(&posts, only.as_deref(), &line).await {
                 Ok(text) => json!({"ok": true, "text": text}),
                 Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
             };
@@ -540,8 +551,11 @@ pub async fn serve(listener: tokio::net::UnixListener, posts: Arc<Posts>) {
     }
 }
 
-async fn handle_request(posts: &Posts, line: &str) -> Result<String> {
+async fn handle_request(posts: &Posts, only: Option<&str>, line: &str) -> Result<String> {
     let req: Request = serde_json::from_str(line).context("bad request")?;
+    if only.is_some_and(|t| t != req.token) {
+        bail!("this turn is over or unknown; its tools no longer work");
+    }
     posts.call(&req.token, &req.tool, &req.args).await
 }
 
@@ -1180,6 +1194,34 @@ mod tests {
             .unwrap();
         let bodies: Vec<String> = got.lock().unwrap().iter().map(|p| p.body.clone()).collect();
         assert_eq!(bodies, ["x", "one\n\n[🔍 sessie](u)", "two"]);
+    }
+
+    #[tokio::test]
+    async fn a_run_socket_refuses_every_other_live_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("run.sock");
+        let posts = Arc::new(Posts::default());
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let mine = posts
+            .register(turn(got.clone(), reads.clone(), tmp.path()))
+            .unwrap();
+        let other = posts
+            .register(turn(got.clone(), reads.clone(), tmp.path()))
+            .unwrap();
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(serve_token(listener, posts.clone(), mine.token.clone()));
+
+        let call = |token: String| {
+            let s = sock.clone();
+            tokio::task::spawn_blocking(move || {
+                call_socket(&s, &token, "post", &json!({"body": "hi"}))
+            })
+        };
+        assert!(call(other.token.clone()).await.unwrap().is_err());
+        assert_eq!(got.lock().unwrap().len(), 0);
+        assert!(call(mine.token.clone()).await.unwrap().is_ok());
+        assert_eq!(got.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
