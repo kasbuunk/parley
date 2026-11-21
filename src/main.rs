@@ -48,6 +48,7 @@ mod confine;
 mod image;
 mod layered;
 mod memory;
+mod platform;
 mod post;
 mod read;
 mod say;

@@ -128,6 +128,13 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
   (its `m.room.member` event, keeping avatar and the rest; the global
   profile stays `agent`). Applied at start, on joining and at each turn,
   only when it differs; a failure is logged and the room goes on.
+- `src/platform.rs`: `runtime = "agent-platform"` in room.toml runs each
+  turn as one Kubernetes Job (gVisor, Cilium, only Anthropic reachable)
+  through agent-platform's `bin/spawn`, with
+  `/var/lib/agent-platform/parley.kubeconfig`. The message and system
+  prompt go over `kubectl attach -i`, never in argv or the Job spec. No
+  MCP tools, no session: use `reply = "text"` and `window N`. The Job is
+  deleted when the turn ends, and a failure never falls back to a local run.
 - `src/breaker.rs`: the circuit breaker (also used for the Matrix sync loop).
 
 ## State on the lab

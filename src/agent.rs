@@ -128,6 +128,17 @@ pub struct Profile {
     /// The bot's name in this room only (its `m.room.member` event). The
     /// account's global profile stays as it is.
     pub display_name: Option<String>,
+    /// Where a turn runs: `local`, or `agent-platform` for one Kubernetes
+    /// Job per turn (see `platform.rs`). Fails closed.
+    pub runtime: Runtime,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Runtime {
+    #[default]
+    Local,
+    AgentPlatform,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -194,6 +205,7 @@ impl Default for Profile {
             trace: None,
             run_as: None,
             display_name: None,
+            runtime: Runtime::Local,
         }
     }
 }
@@ -275,6 +287,8 @@ pub struct ClaudeCode {
     pub cgroups: Option<Arc<crate::cgroup::Pool>>,
     /// At most this many runs at once, over all rooms; the rest wait.
     pub slots: Arc<tokio::sync::Semaphore>,
+    /// Where `runtime = "agent-platform"` rooms run.
+    pub platform: crate::platform::Platform,
 }
 
 impl ClaudeCode {
@@ -286,6 +300,7 @@ impl ClaudeCode {
             slots: Arc::new(tokio::sync::Semaphore::new(
                 tokio::sync::Semaphore::MAX_PERMITS,
             )),
+            platform: Default::default(),
         }
     }
 
@@ -350,6 +365,10 @@ impl Harness for ClaudeCode {
                 self.slots.clone().acquire_owned().await?
             }
         };
+        // Before anything local is set up: it never falls back to a local run.
+        if run.profile.runtime == Runtime::AgentPlatform {
+            return self.platform.run(run).await;
+        }
         let scope = match &self.cgroups {
             Some(pool) => match pool.scope() {
                 Ok(scope) => Some(scope),
@@ -436,27 +455,32 @@ impl Harness for ClaudeCode {
             (result, _, _) => result?,
         };
 
-        #[derive(Deserialize)]
-        struct Reply {
-            result: Option<String>,
-            #[serde(default)]
-            is_error: bool,
-            session_id: Option<String>,
-        }
-        let reply: Reply = serde_json::from_slice(&output.stdout).with_context(|| {
+        parse_reply(&output.stdout, || {
             format!(
                 "claude exited with {}: {}",
                 output.status,
                 String::from_utf8_lossy(&output.stderr).trim()
             )
-        })?;
-        match reply.result {
-            Some(text) if !reply.is_error => Ok(Output {
-                text,
-                session: reply.session_id,
-            }),
-            other => bail!("claude reported an error: {}", other.unwrap_or_default()),
-        }
+        })
+    }
+}
+
+/// Claude Code's `--output-format json` result.
+pub fn parse_reply(stdout: &[u8], detail: impl FnOnce() -> String) -> Result<Output> {
+    #[derive(Deserialize)]
+    struct Reply {
+        result: Option<String>,
+        #[serde(default)]
+        is_error: bool,
+        session_id: Option<String>,
+    }
+    let reply: Reply = serde_json::from_slice(stdout).with_context(detail)?;
+    match reply.result {
+        Some(text) if !reply.is_error => Ok(Output {
+            text,
+            session: reply.session_id,
+        }),
+        other => bail!("claude reported an error: {}", other.unwrap_or_default()),
     }
 }
 
@@ -731,6 +755,7 @@ impl<H: Harness> Agent<H> {
             model: Some("haiku".into()),
             timeout_secs: 120,
             run_as: profile.run_as.clone(),
+            runtime: profile.runtime,
             ..Profile::default()
         };
         loop {
@@ -771,11 +796,12 @@ impl<H: Harness> Agent<H> {
         let input = memory::digest_input(notes.as_deref(), &ex.sender, &ex.body, &ex.answer);
         // Locked down and small: it only rewrites text. As the room's own
         // user, so nothing of a `run_as` room runs as parley's.
-        let run_as = Self::profile(&dir).await?.run_as;
+        let room = Self::profile(&dir).await?;
         let profile = Profile {
             model: Some("haiku".into()),
             timeout_secs: 120,
-            run_as,
+            run_as: room.run_as,
+            runtime: room.runtime,
             ..Profile::default()
         };
         let out = self
@@ -1080,6 +1106,9 @@ impl<H: Harness> Agent<H> {
         };
 
         let (mode, _) = Self::mode(&dir, &profile).await?;
+        if profile.runtime == Runtime::AgentPlatform {
+            crate::platform::check(&profile, mode.resumes(), mcp_config.is_some())?;
+        }
         let session_file = self.session_file(&dir, thread)?;
         let saved = if mode.resumes() {
             Saved::read(&session_file).await
@@ -1119,10 +1148,8 @@ impl<H: Harness> Agent<H> {
                     n,
                     layered::day_of(now()),
                     &have,
-                    // A `run_as` user cannot read this file.
-                    profile
-                        .run_as
-                        .is_none()
+                    // A `run_as` user or a pod cannot read this file.
+                    (profile.run_as.is_none() && profile.runtime == Runtime::Local)
                         .then(|| path.display().to_string())
                         .as_deref(),
                     &message,
