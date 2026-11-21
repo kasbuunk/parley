@@ -2,6 +2,10 @@
 //! room.toml starts one Kubernetes Job per turn (gVisor, Cilium) through the
 //! platform's `bin/spawn`, instead of a local `claude`.
 //!
+//! The platform owns the pod: image, resources, sandbox and egress labels are
+//! in its profile (`pod_profile` in room.toml, or the platform's default).
+//! Parley asks for a profile and adds the harness's flags.
+//!
 //! The pod can reach only Anthropic, so it gets no MCP tools and no
 //! `post.sock`: parley posts the run's final answer. The pod is thrown away,
 //! so there is no session to resume; context comes from a prompt mode.
@@ -33,8 +37,6 @@ use tokio::{io::AsyncWriteExt, process::Command};
 use crate::agent::{Output, Profile, ReplyMode, Run, parse_reply};
 
 const NAMESPACE: &str = "agents";
-const SECRET: &str = "agent-claude";
-const RUNTIME_CLASS: &str = "gvisor";
 /// Pod states that will not get better by waiting.
 const STUCK: &[&str] = &[
     "ErrImagePull",
@@ -160,35 +162,6 @@ fn pod_state(list: &[u8]) -> Result<Pod> {
     })
 }
 
-/// The Job as `spawn --print` made it, made to wait for its input on stdin.
-fn with_stdin(job: &[u8], deadline: u64) -> Result<Vec<u8>> {
-    let mut job: serde_json::Value = serde_json::from_slice(job).context("spawn printed no Job")?;
-    job["spec"]["activeDeadlineSeconds"] = deadline.into();
-    job["metadata"]["labels"]["app.kubernetes.io/managed-by"] = "parley".into();
-    // Nothing in the cluster enforces gVisor, so a Job without it is refused
-    // here rather than run on the host's kernel.
-    let runtime = job["spec"]["template"]["spec"]["runtimeClassName"].as_str();
-    if runtime != Some(RUNTIME_CLASS) {
-        bail!("the Job's runtime class is {runtime:?}, not {RUNTIME_CLASS}");
-    }
-    let container = job["spec"]["template"]["spec"]["containers"]
-        .get_mut(0)
-        .context("the Job has no container")?;
-    container["stdin"] = true.into();
-    container["stdinOnce"] = true.into();
-    container["tty"] = false.into();
-    // The image is loaded into containerd; there is no registry to pull from.
-    container["imagePullPolicy"] = "Never".into();
-    // The sandbox is killed at once on this cluster when requests are below
-    // limits.
-    let limits = container["resources"]["limits"].clone();
-    if !limits.is_object() {
-        bail!("the Job's container has no resource limits");
-    }
-    container["resources"]["requests"] = limits;
-    Ok(serde_json::to_vec(&job)?)
-}
-
 /// The fixed flags of a run; nothing of the conversation.
 fn claude_args(profile: &Profile) -> Vec<String> {
     let mut args: Vec<String> = vec!["-p".into(), "--tools".into(), profile.tools.clone()];
@@ -297,18 +270,16 @@ impl Platform {
         })?;
         let name = job_name()?;
         let timeout = Duration::from_secs(run.profile.timeout_secs);
-        let spawned = Command::new(&self.spawn)
-            .arg(&name)
-            .args([
-                "--namespace",
-                NAMESPACE,
-                "--secret",
-                SECRET,
-                "--runtime-class",
-                RUNTIME_CLASS,
-                "--print",
-                "--",
-            ])
+        // Outlives parley's own timeout a little, so that one reports first.
+        let deadline = run.profile.timeout_secs + 60;
+        let mut spawn = Command::new(&self.spawn);
+        spawn.arg(&name).args(["--namespace", NAMESPACE]);
+        if let Some(profile) = &run.profile.pod_profile {
+            spawn.args(["--profile", profile]);
+        }
+        let spawned = spawn
+            .args(["--stdin", "--deadline", &deadline.to_string()])
+            .args(["--print", "--"])
             .args(claude_args(run.profile))
             .env_clear()
             .envs(base_env())
@@ -323,8 +294,7 @@ impl Platform {
                 String::from_utf8_lossy(&spawned.stderr).trim()
             );
         }
-        // Outlives parley's own timeout a little, so that one reports first.
-        let job = with_stdin(&spawned.stdout, run.profile.timeout_secs + 60)?;
+        let job = spawned.stdout;
 
         // Before the create: a create that fails halfway leaves nothing.
         let _guard = JobGuard {
@@ -453,23 +423,6 @@ mod tests {
 
     const JOB: &str = r#"{"metadata":{"labels":{}},"spec":{"template":{"spec":{"runtimeClassName":"gvisor","containers":[{"name":"agent","imagePullPolicy":"IfNotPresent","resources":{"requests":{"cpu":"250m","memory":"512Mi"},"limits":{"cpu":"2","memory":"2Gi"}}}]}}}}"#;
 
-    #[test]
-    fn the_job_cannot_be_pulled_or_leave_gvisor() {
-        let job: serde_json::Value =
-            serde_json::from_slice(&with_stdin(JOB.as_bytes(), 90).unwrap()).unwrap();
-        let container = &job["spec"]["template"]["spec"]["containers"][0];
-        assert_eq!(container["imagePullPolicy"], "Never");
-        assert_eq!(
-            container["resources"]["requests"],
-            container["resources"]["limits"]
-        );
-
-        let without = JOB.replace(r#""runtimeClassName":"gvisor","#, "");
-        assert!(with_stdin(without.as_bytes(), 90).is_err());
-        let other = JOB.replace(r#""gvisor""#, r#""runc""#);
-        assert!(with_stdin(other.as_bytes(), 90).is_err());
-    }
-
     /// A fake `spawn` and `kubectl` in `dir`; `phase` is what the pod reports
     /// once attached, `waiting` a container waiting reason.
     fn fake(dir: &Path, phase: &str, waiting: &str) -> Platform {
@@ -551,15 +504,33 @@ esac"#
             let text = std::fs::read_to_string(tmp.path().join(file)).unwrap();
             assert!(!text.contains("SECRET-"), "{file}: {text}");
         }
-        let job: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(tmp.path().join("job.json")).unwrap()).unwrap();
-        let container = &job["spec"]["template"]["spec"]["containers"][0];
-        assert_eq!(container["stdin"], true);
-        assert_eq!(container["stdinOnce"], true);
-        assert_eq!(job["spec"]["activeDeadlineSeconds"], 90);
+        // The Job is the platform's, unchanged.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("job.json")).unwrap(),
+            JOB
+        );
         let args = std::fs::read_to_string(tmp.path().join("spawn.args")).unwrap();
-        assert!(args.contains("agent-claude") && args.contains("--print"));
+        let args: Vec<&str> = args.lines().collect();
+        assert!(args.contains(&"--stdin") && args.contains(&"--print"));
+        assert!(args.windows(2).any(|w| w == ["--deadline", "90"]));
+        assert!(!args.contains(&"--profile"));
         assert!(deleted(tmp.path()).await.contains("delete job parley-"));
+    }
+
+    #[tokio::test]
+    async fn asks_for_the_rooms_pod_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = Profile {
+            pod_profile: Some("research".into()),
+            ..profile(30)
+        };
+        fake(tmp.path(), "Succeeded", "")
+            .run(&run(&p, tmp.path()))
+            .await
+            .unwrap();
+        let args = std::fs::read_to_string(tmp.path().join("spawn.args")).unwrap();
+        let args: Vec<&str> = args.lines().collect();
+        assert!(args.windows(2).any(|w| w == ["--profile", "research"]));
     }
 
     #[tokio::test]

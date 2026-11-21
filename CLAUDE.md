@@ -131,7 +131,9 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
 - `src/platform.rs`: `runtime = "agent-platform"` in room.toml runs each
   turn as one Kubernetes Job (gVisor, Cilium, only Anthropic reachable)
   through agent-platform's `bin/spawn`, with
-  `/var/lib/agent-platform/parley.kubeconfig`. The message and system
+  `/var/lib/agent-platform/parley.kubeconfig`. The platform owns the pod
+  (image, resources, sandbox, egress labels) in a profile, a PodTemplate
+  in its `profiles/`; `pod_profile` in room.toml picks one. The message and system
   prompt go over `kubectl attach -i`, never in argv or the Job spec. No
   MCP tools, no session: use `reply = "text"` and `window N`. The Job is
   deleted when the turn ends, and a failure never falls back to a local run.

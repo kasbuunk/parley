@@ -131,6 +131,9 @@ pub struct Profile {
     /// Where a turn runs: `local`, or `agent-platform` for one Kubernetes
     /// Job per turn (see `platform.rs`). Fails closed.
     pub runtime: Runtime,
+    /// With `runtime = "agent-platform"`: the platform's profile for the
+    /// pod. Default: the platform's default profile.
+    pub pod_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -206,6 +209,7 @@ impl Default for Profile {
             run_as: None,
             display_name: None,
             runtime: Runtime::Local,
+            pod_profile: None,
         }
     }
 }
@@ -756,6 +760,7 @@ impl<H: Harness> Agent<H> {
             timeout_secs: 120,
             run_as: profile.run_as.clone(),
             runtime: profile.runtime,
+            pod_profile: profile.pod_profile.clone(),
             ..Profile::default()
         };
         loop {
@@ -802,6 +807,7 @@ impl<H: Harness> Agent<H> {
             timeout_secs: 120,
             run_as: room.run_as,
             runtime: room.runtime,
+            pod_profile: room.pod_profile,
             ..Profile::default()
         };
         let out = self
