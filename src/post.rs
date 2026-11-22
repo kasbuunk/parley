@@ -85,6 +85,20 @@ pub struct ImagePost {
 
 /// Sends an image; returns the new event's ID.
 pub type ImageFn = Arc<dyn Fn(ImagePost) -> Future_<Result<String>> + Send + Sync>;
+/// A voice message to post (the `speak` tool).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeechPost {
+    /// The room's ID.
+    pub room: String,
+    pub target: Target,
+    /// What is said.
+    pub text: String,
+    /// What is shown with it: the text, signed or with a link where needed.
+    pub caption: String,
+}
+
+/// Makes and sends a voice message; returns the new event's ID.
+pub type SpeakFn = Arc<dyn Fn(SpeechPost) -> Future_<Result<String>> + Send + Sync>;
 /// Reads a page of a room (by ID).
 pub type ReadFn = Arc<dyn Fn(String, read::Query) -> Future_<Result<read::Page>> + Send + Sync>;
 
@@ -96,6 +110,7 @@ pub struct Turn {
     /// Posts an image. None where the run may not read files itself, so
     /// the tool cannot widen what a confined room's agent can get at.
     pub image: Option<ImageFn>,
+    pub speak: SpeakFn,
     pub read: ReadFn,
     /// Where the `schedule` tools keep their schedules.
     pub schedules: Arc<schedule::Store>,
@@ -284,6 +299,42 @@ impl Posts {
                 .await?;
                 count.fetch_add(1, Ordering::SeqCst);
                 Ok(format!("Posted the image ({id})."))
+            }
+            "speak" => {
+                let text = s("text").unwrap_or("").trim().to_owned();
+                if text.is_empty() {
+                    bail!("the text is empty");
+                }
+                let room = a.room(s("room"))?;
+                let target = match Target::parse(s("thread"))? {
+                    Target::Here if room != a.here => Target::Main,
+                    t => t,
+                };
+                let scope = match &target {
+                    Target::Here => a.here_scope.clone(),
+                    Target::Main => Scope::Main,
+                    Target::Thread(t) => Scope::Thread(t.clone()),
+                };
+                a.check(&room, &scope, true)?;
+                let mut caption = text.clone();
+                if room == a.here
+                    && target == Target::Here
+                    && let Some(link) = turn.link.lock().unwrap().take()
+                {
+                    caption = format!("{caption}\n\n{link}");
+                }
+                if room != a.here {
+                    caption = sign(&caption, &turn.signer, &a.here_name());
+                }
+                let id = (turn.speak)(SpeechPost {
+                    room,
+                    target,
+                    text,
+                    caption,
+                })
+                .await?;
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(format!("Posted the voice message ({id})."))
             }
             "read" => {
                 let room = a.room(s("room"))?;
@@ -603,6 +654,12 @@ machine, for what is better seen than read, such as a QR code to scan. It \
 works only in encrypted rooms. Everyone in the room can see it and it stays \
 in the history, so post an image holding a secret only when the person it \
 is for asked for it, and only in a room with no one else.\n\n\
+## Speaking\n\n\
+The `speak` tool posts a voice message with the text as its caption. Use \
+it when someone asks to hear you, or sent a voice message and a spoken \
+answer fits; it replaces the `post` for that answer, so do not repeat the \
+text. Write plain sentences as you would say them: no Markdown, code, \
+links or long lists. For those, use `post`.\n\n\
 ## Other rooms\n\n\
 Where `rooms` says you may post, you may do what Kas would otherwise do \
 for you there: when work belongs in another room, hand it over yourself \
@@ -675,6 +732,19 @@ fn tools() -> Value {
                     "room": room,
                 },
                 "required": ["path"]
+            }
+        },
+        {
+            "name": "speak",
+            "description": "Say something as a Matrix voice message (text to speech), with the text as its caption. Plain spoken sentences, at most 3000 characters. By default it goes to the conversation this turn answers. Returns the new event's ID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "What to say, as plain sentences."},
+                    "thread": {"type": "string", "description": "Omit for this conversation (in another room: its main timeline); \"main\" for the main timeline; or a thread's root event ID."},
+                    "room": room,
+                },
+                "required": ["text"]
             }
         },
         {
@@ -784,13 +854,15 @@ pub fn handle_rpc(msg: &Value, call: &mut CallFn<'_>) -> Option<Value> {
                 "post" if args.get("body").and_then(Value::as_str).is_none() => {
                     Err("`body` is required".to_owned())
                 }
-                "post" | "image" | "read" | "rooms" | "schedule" | "schedules" | "cancel"
-                | "handoff" | "approve" | "task" | "tasks" => call(name, &args),
+                "post" | "image" | "speak" | "read" | "rooms" | "schedule" | "schedules"
+                | "cancel" | "handoff" | "approve" | "task" | "tasks" => call(name, &args),
                 _ => Err(format!("unknown tool {name:?}")),
             };
             let (text, is_error) = match outcome {
                 Ok(t) => (t, false),
-                Err(e) if name == "post" || name == "image" => (format!("Not posted: {e}"), true),
+                Err(e) if matches!(name, "post" | "image" | "speak") => {
+                    (format!("Not posted: {e}"), true)
+                }
                 Err(e) => (format!("Failed: {e}"), true),
             };
             json!({"content": [{"type": "text", "text": text}], "isError": is_error})
@@ -926,6 +998,7 @@ mod tests {
             [
                 "post",
                 "image",
+                "speak",
                 "read",
                 "rooms",
                 "schedule",
@@ -1006,6 +1079,7 @@ mod tests {
                 Box::pin(async { Ok("$new".to_owned()) })
             }),
             image: None,
+            speak: Arc::new(|_| Box::pin(async { Ok("$voice".to_owned()) })),
             read: Arc::new(move |room, q| {
                 reads.lock().unwrap().push((room, q));
                 Box::pin(async {

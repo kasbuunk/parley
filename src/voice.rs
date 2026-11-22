@@ -38,13 +38,18 @@ pub fn transcriber() -> PathBuf {
     if let Some(p) = std::env::var_os("PARLEY_TRANSCRIBE") {
         return PathBuf::from(p);
     }
+    sibling("parley-transcribe")
+}
+
+/// The program `name` next to this executable, or else on PATH.
+pub fn sibling(name: &str) -> PathBuf {
     let started = std::env::args_os().next().map(PathBuf::from);
     [started, std::env::current_exe().ok()]
         .into_iter()
         .flatten()
-        .filter_map(|exe| exe.parent().map(|d| d.join("parley-transcribe")))
+        .filter_map(|exe| exe.parent().map(|d| d.join(name)))
         .find(|p| p.is_absolute() && p.exists())
-        .unwrap_or_else(|| PathBuf::from("parley-transcribe"))
+        .unwrap_or_else(|| PathBuf::from(name))
 }
 
 /// The text `program` hears in the audio file `file`.

@@ -99,6 +99,11 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
   text message `🎤 <transcript>`. `voice` in room.toml: `reply` (default:
   the transcript is also posted as a reply, where the answer will come),
   `quiet`, or `off`. A 5-second clip takes about 20 s.
+- `src/speech.rs`: speaking. The MCP tool `speak(text, thread?, room?)`
+  posts a Matrix voice message with the text as caption. The voice is an
+  outside program: `<program> <out.ogg>`, text on stdin, Ogg Opus out.
+  Default `parley-speak` (Piper, Dutch voice `nl_NL-alex-medium`, pinned in
+  the flake); set `PARLEY_SPEAK` to swap it, for example for ElevenLabs.
 - Tracing: `trace = "https://agents.lab.artintel.ai"` in room.toml makes
   every run keep its Claude Code session file (a new session gets its ID
   up front with `--session-id`) and puts `[🔍 sessie](<trace>/sessions/<id>)`

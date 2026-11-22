@@ -53,6 +53,7 @@ mod post;
 mod read;
 mod say;
 mod schedule;
+mod speech;
 mod tasks;
 mod voice;
 
@@ -816,10 +817,13 @@ async fn tool_turn(
     let run_as = agent.run_as(room.room_id()).await;
     let image = (run_as.is_none() && agent.reads_files(room.room_id()).await)
         .then(|| image_tool(client, agent, room.room_id().to_owned(), here, reply_to));
+    // Only text goes in, so this gives a confined run nothing `post` doesn't.
+    let speak = speak_tool(client, agent, room.room_id().to_owned(), here, reply_to);
     Ok(post::Turn {
         access,
         send,
         image,
+        speak,
         read,
         schedules: tooling.schedules.clone(),
         depth,
@@ -1017,13 +1021,15 @@ async fn client_tools(
         None => Vec::new(),
     };
     let (send, read) = room_tools(client, agent, home_id.clone(), None, None);
-    let image = image_tool(client, agent, home_id, &None, &None);
+    let image = image_tool(client, agent, home_id.clone(), &None, &None);
+    let speak = speak_tool(client, agent, home_id, &None, &None);
     tooling.posts.insert(
         c.token,
         post::Turn {
             access,
             send,
             image: Some(image),
+            speak,
             read,
             schedules: tooling.schedules.clone(),
             depth: 0,
@@ -1165,6 +1171,83 @@ fn image_tool(
             let sent = room
                 .send_attachment(p.image.filename, &mime, p.image.data, config)
                 .await?;
+            let thread = thread.as_ref().map(|t| t.as_str());
+            if let Err(e) = agent.record(room.room_id(), thread, "agent", &note).await {
+                eprintln!("could not write transcript: {e}");
+            }
+            Ok(sent.event_id.to_string())
+        })
+    })
+}
+
+/// The `speak` tool of a turn whose own room is `home`: sends a voice
+/// message with what it says as its caption, so it can also be read.
+fn speak_tool(
+    client: &Client,
+    agent: &Arc<Agent<ClaudeCode>>,
+    home: OwnedRoomId,
+    here: &Option<OwnedEventId>,
+    reply_to: &Option<OwnedEventId>,
+) -> post::SpeakFn {
+    use matrix_sdk::{
+        attachment::{AttachmentConfig, AttachmentInfo, BaseAudioInfo},
+        room::reply::{EnforceThread, Reply},
+        ruma::{
+            UInt,
+            events::room::message::{AddMentions, ReplyWithinThread, TextMessageEventContent},
+        },
+    };
+    let (c, agent, here, reply_to) = (
+        client.clone(),
+        agent.clone(),
+        here.clone(),
+        reply_to.clone(),
+    );
+    Arc::new(move |p: post::SpeechPost| {
+        let (c, agent, here, reply_to, home) = (
+            c.clone(),
+            agent.clone(),
+            here.clone(),
+            reply_to.clone(),
+            home.clone(),
+        );
+        Box::pin(async move {
+            let room = joined(&c, &p.room)?;
+            let spoken = speech::speak(&speech::speaker(), &p.text, speech::TIMEOUT).await?;
+            let (thread, anchor) = match &p.target {
+                post::Target::Here if room.room_id() == home => (
+                    here.clone(),
+                    here.as_ref()
+                        .map(|root| reply_to.clone().unwrap_or(root.clone())),
+                ),
+                post::Target::Thread(t) => {
+                    let root = OwnedEventId::try_from(t.as_str()).context("bad thread ID")?;
+                    (Some(root.clone()), Some(root))
+                }
+                _ => (None, None),
+            };
+            // Clients draw a voice message only with a waveform. The audio
+            // is not decoded here, so this one is flat.
+            let info = BaseAudioInfo {
+                duration: Some(spoken.duration),
+                size: UInt::new(spoken.data.len() as u64),
+                waveform: Some(vec![0.5; 30]),
+            };
+            let mut config = AttachmentConfig::new()
+                .info(AttachmentInfo::Voice(info))
+                .caption(Some(TextMessageEventContent::markdown(&p.caption)));
+            if let Some(event_id) = anchor {
+                config = config.reply(Some(Reply {
+                    event_id,
+                    enforce_thread: EnforceThread::Threaded(ReplyWithinThread::No),
+                    add_mentions: AddMentions::No,
+                }));
+            }
+            let mime: mime::Mime = "audio/ogg".parse().context("bad audio type")?;
+            let sent = room
+                .send_attachment("voice.ogg", &mime, spoken.data, config)
+                .await?;
+            let note = format!("[voice] {}", p.text);
             let thread = thread.as_ref().map(|t| t.as_str());
             if let Err(e) = agent.record(room.room_id(), thread, "agent", &note).await {
                 eprintln!("could not write transcript: {e}");
