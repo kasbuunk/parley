@@ -73,18 +73,18 @@ pub struct Post {
 type Future_<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// Sends a post; returns the new event's ID.
 pub type SendFn = Arc<dyn Fn(Post) -> Future_<Result<String>> + Send + Sync>;
-/// An image to post (the `image` tool).
+/// A file to post (the `file` tool).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImagePost {
+pub struct FilePost {
     /// The room's ID.
     pub room: String,
     pub target: Target,
-    pub image: crate::image::Loaded,
+    pub file: crate::file::Loaded,
     pub caption: Option<String>,
 }
 
-/// Sends an image; returns the new event's ID.
-pub type ImageFn = Arc<dyn Fn(ImagePost) -> Future_<Result<String>> + Send + Sync>;
+/// Sends a file; returns the new event's ID.
+pub type FileFn = Arc<dyn Fn(FilePost) -> Future_<Result<String>> + Send + Sync>;
 /// A voice message to post (the `speak` tool).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpeechPost {
@@ -107,9 +107,9 @@ pub type ReadFn = Arc<dyn Fn(String, read::Query) -> Future_<Result<read::Page>>
 pub struct Turn {
     pub access: Access,
     pub send: SendFn,
-    /// Posts an image. None where the run may not read files itself, so
+    /// Posts a file. None where the run may not read files itself, so
     /// the tool cannot widen what a confined room's agent can get at.
-    pub image: Option<ImageFn>,
+    pub file: Option<FileFn>,
     pub speak: SpeakFn,
     pub read: ReadFn,
     /// Where the `schedule` tools keep their schedules.
@@ -255,9 +255,9 @@ impl Posts {
                 count.fetch_add(1, Ordering::SeqCst);
                 Ok(format!("Posted ({id})."))
             }
-            "image" => {
+            "file" => {
                 let send = turn
-                    .image
+                    .file
                     .as_ref()
                     .context("this room's agent may not read files, so it cannot post them")?;
                 let path = s("path").context("`path` is required")?;
@@ -272,7 +272,7 @@ impl Posts {
                     Target::Thread(t) => Scope::Thread(t.clone()),
                 };
                 a.check(&room, &scope, true)?;
-                let image = crate::image::load(path).await?;
+                let file = crate::file::load(path).await?;
                 let mut caption = s("caption")
                     .map(str::trim)
                     .filter(|c| !c.is_empty())
@@ -287,18 +287,18 @@ impl Posts {
                     });
                 }
                 if room != a.here {
-                    let c = caption.unwrap_or_else(|| image.filename.clone());
+                    let c = caption.unwrap_or_else(|| file.filename.clone());
                     caption = Some(sign(&c, &turn.signer, &a.here_name()));
                 }
-                let id = send(ImagePost {
+                let id = send(FilePost {
                     room,
                     target,
-                    image,
+                    file,
                     caption,
                 })
                 .await?;
                 count.fetch_add(1, Ordering::SeqCst);
-                Ok(format!("Posted the image ({id})."))
+                Ok(format!("Posted the file ({id})."))
             }
             "speak" => {
                 let text = s("text").unwrap_or("").trim().to_owned();
@@ -648,11 +648,13 @@ returns a page, newest first unless `order: \"oldest\"`, filtered by \
 (YYYY-MM-DD or unix seconds), `sender` and `contains`, with a cursor for \
 the next page. Use it when the past matters instead of guessing. `post` \
 takes a `room` too.\n\n\
-## Images\n\n\
-The `image` tool posts an image file (PNG, JPEG, GIF, WebP) from this \
-machine, for what is better seen than read, such as a QR code to scan. It \
+## Files\n\n\
+The `file` tool posts any file from this machine, up to 20 MB: a PDF, a \
+song, an image, a video, a spreadsheet. Images, audio and video play in \
+the chat; the rest is a download. So when someone asks for something that \
+is better as a file, make it and send it instead of describing it. It \
 works only in encrypted rooms. Everyone in the room can see it and it stays \
-in the history, so post an image holding a secret only when the person it \
+in the history, so post a file holding a secret only when the person it \
 is for asked for it, and only in a room with no one else.\n\n\
 ## Speaking\n\n\
 The `speak` tool posts a voice message with the text as its caption. Use \
@@ -721,13 +723,13 @@ fn tools() -> Value {
             }
         },
         {
-            "name": "image",
-            "description": "Post an image file from this machine (PNG, JPEG, GIF or WebP, at most 10 MB) to an encrypted Matrix room, end-to-end encrypted. By default it goes to the conversation this turn answers. Returns the new event's ID.",
+            "name": "file",
+            "description": "Post any file from this machine (PDF, audio, image, video, anything; at most 20 MB) to an encrypted Matrix room, end-to-end encrypted. Images, audio and video show in the chat, the rest is a download. By default it goes to the conversation this turn answers. Returns the new event's ID.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Absolute path of the image."},
-                    "caption": {"type": "string", "description": "Optional text with the image, in Markdown."},
+                    "path": {"type": "string", "description": "Absolute path of the file. Its name is what people see."},
+                    "caption": {"type": "string", "description": "Optional text with the file, in Markdown."},
                     "thread": {"type": "string", "description": "Omit for this conversation (in another room: its main timeline); \"main\" for the main timeline; or a thread's root event ID."},
                     "room": room,
                 },
@@ -854,13 +856,13 @@ pub fn handle_rpc(msg: &Value, call: &mut CallFn<'_>) -> Option<Value> {
                 "post" if args.get("body").and_then(Value::as_str).is_none() => {
                     Err("`body` is required".to_owned())
                 }
-                "post" | "image" | "speak" | "read" | "rooms" | "schedule" | "schedules"
+                "post" | "file" | "speak" | "read" | "rooms" | "schedule" | "schedules"
                 | "cancel" | "handoff" | "approve" | "task" | "tasks" => call(name, &args),
                 _ => Err(format!("unknown tool {name:?}")),
             };
             let (text, is_error) = match outcome {
                 Ok(t) => (t, false),
-                Err(e) if matches!(name, "post" | "image" | "speak") => {
+                Err(e) if matches!(name, "post" | "file" | "speak") => {
                     (format!("Not posted: {e}"), true)
                 }
                 Err(e) => (format!("Failed: {e}"), true),
@@ -997,7 +999,7 @@ mod tests {
             names,
             [
                 "post",
-                "image",
+                "file",
                 "speak",
                 "read",
                 "rooms",
@@ -1078,7 +1080,7 @@ mod tests {
                 got.lock().unwrap().push(p);
                 Box::pin(async { Ok("$new".to_owned()) })
             }),
-            image: None,
+            file: None,
             speak: Arc::new(|_| Box::pin(async { Ok("$voice".to_owned()) })),
             read: Arc::new(move |room, q| {
                 reads.lock().unwrap().push((room, q));

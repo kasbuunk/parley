@@ -894,7 +894,7 @@ impl<H: Harness> Agent<H> {
     }
 
     /// Whether this room's runs can read files themselves; only then may
-    /// they post one with the `image` tool.
+    /// they post one with the `file` tool.
     pub async fn reads_files(&self, room_id: &RoomId) -> bool {
         match self.room_dir(room_id) {
             Ok(dir) => tools_read_files(&Self::profile(&dir).await.unwrap_or_default().tools),

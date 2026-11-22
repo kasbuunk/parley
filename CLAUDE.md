@@ -99,6 +99,11 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
   text message `🎤 <transcript>`. `voice` in room.toml: `reply` (default:
   the transcript is also posted as a reply, where the answer will come),
   `quiet`, or `off`. A 5-second clip takes about 20 s.
+- `src/file.rs`: the MCP tool `file(path, caption?, thread?, room?)` posts
+  any file from the lab, end-to-end encrypted and only to encrypted rooms,
+  up to the homeserver's 20 MB. Images (by content), audio and video (by
+  extension) show in the chat; the rest is a download. Not for `run_as`
+  rooms or rooms whose tools cannot read files.
 - `src/speech.rs`: speaking. The MCP tool `speak(text, thread?, room?)`
   posts a Matrix voice message with the text as caption. The voice is an
   outside program: `<program> <out.ogg>`, text on stdin, Ogg Opus out.
@@ -126,7 +131,7 @@ is acceptable (Kas is around), but keep the way back open; see "Deploying".
   cleared env, cwd `/` (the wrapper picks the workdir, so `workdir` is
   refused). The message goes over stdin and the MCP config is a file, so
   neither is in sudo's log. Each turn gets its own socket in
-  `/run/parley-<user>` that accepts only its token. No `image`, `task`,
+  `/run/parley-<user>` that accepts only its token. No `file`, `task`,
   `tasks`, trace link or transcript path. It fails closed: no sudo, no
   wrapper or no cgroup means no run.
 - `display_name = "Paul"` in room.toml: the bot's name in that room only

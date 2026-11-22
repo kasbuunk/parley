@@ -45,7 +45,7 @@ mod breaker;
 mod cgroup;
 mod clients;
 mod confine;
-mod image;
+mod file;
 mod layered;
 mod memory;
 mod platform;
@@ -812,17 +812,17 @@ async fn tool_turn(
         },
         None => "agent".to_owned(),
     };
-    // These two act with parley's own rights on the machine: `image` reads
+    // These two act with parley's own rights on the machine: `file` reads
     // any path, `tasks` lists Kas's notes. Not for a run as another user.
     let run_as = agent.run_as(room.room_id()).await;
-    let image = (run_as.is_none() && agent.reads_files(room.room_id()).await)
-        .then(|| image_tool(client, agent, room.room_id().to_owned(), here, reply_to));
+    let file = (run_as.is_none() && agent.reads_files(room.room_id()).await)
+        .then(|| file_tool(client, agent, room.room_id().to_owned(), here, reply_to));
     // Only text goes in, so this gives a confined run nothing `post` doesn't.
     let speak = speak_tool(client, agent, room.room_id().to_owned(), here, reply_to);
     Ok(post::Turn {
         access,
         send,
-        image,
+        file,
         speak,
         read,
         schedules: tooling.schedules.clone(),
@@ -1021,14 +1021,14 @@ async fn client_tools(
         None => Vec::new(),
     };
     let (send, read) = room_tools(client, agent, home_id.clone(), None, None);
-    let image = image_tool(client, agent, home_id.clone(), &None, &None);
+    let file = file_tool(client, agent, home_id.clone(), &None, &None);
     let speak = speak_tool(client, agent, home_id, &None, &None);
     tooling.posts.insert(
         c.token,
         post::Turn {
             access,
             send,
-            image: Some(image),
+            file: Some(file),
             speak,
             read,
             schedules: tooling.schedules.clone(),
@@ -1098,17 +1098,20 @@ fn room_tools(
     (send, read)
 }
 
-/// The `image` tool of a turn whose own room is `home`. Only to encrypted
-/// rooms: an image may be a secret, like a VPN tunnel's QR code.
-fn image_tool(
+/// The `file` tool of a turn whose own room is `home`. Only to encrypted
+/// rooms: a file may be a secret, like a VPN tunnel's QR code.
+fn file_tool(
     client: &Client,
     agent: &Arc<Agent<ClaudeCode>>,
     home: OwnedRoomId,
     here: &Option<OwnedEventId>,
     reply_to: &Option<OwnedEventId>,
-) -> post::ImageFn {
+) -> post::FileFn {
     use matrix_sdk::{
-        attachment::{AttachmentConfig, AttachmentInfo, BaseImageInfo},
+        attachment::{
+            AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
+            BaseVideoInfo,
+        },
         room::reply::{EnforceThread, Reply},
         ruma::{
             UInt,
@@ -1121,7 +1124,7 @@ fn image_tool(
         here.clone(),
         reply_to.clone(),
     );
-    Arc::new(move |p: post::ImagePost| {
+    Arc::new(move |p: post::FilePost| {
         let (c, agent, here, reply_to, home) = (
             c.clone(),
             agent.clone(),
@@ -1132,7 +1135,7 @@ fn image_tool(
         Box::pin(async move {
             let room = joined(&c, &p.room)?;
             if !room.latest_encryption_state().await?.is_encrypted() {
-                bail!("this room is not encrypted; images are only posted to encrypted rooms");
+                bail!("this room is not encrypted; files are only posted to encrypted rooms");
             }
             // The thread it goes in, and the event that places it there.
             let (thread, anchor) = match &p.target {
@@ -1147,15 +1150,29 @@ fn image_tool(
                 }
                 _ => (None, None),
             };
-            let mime: mime::Mime = p.image.mimetype.parse().context("bad image type")?;
-            let info = BaseImageInfo {
-                width: p.image.size.map(|s| UInt::from(s.0)),
-                height: p.image.size.map(|s| UInt::from(s.1)),
-                size: UInt::new(p.image.data.len() as u64),
-                ..Default::default()
+            let mime: mime::Mime = p.file.mimetype.parse().context("bad file type")?;
+            let size = UInt::new(p.file.data.len() as u64);
+            // The SDK picks the message type from the MIME type; its info
+            // has to be of the same kind.
+            let info = match mime.type_() {
+                mime::IMAGE => AttachmentInfo::Image(BaseImageInfo {
+                    width: p.file.size.map(|s| UInt::from(s.0)),
+                    height: p.file.size.map(|s| UInt::from(s.1)),
+                    size,
+                    ..Default::default()
+                }),
+                mime::AUDIO => AttachmentInfo::Audio(BaseAudioInfo {
+                    size,
+                    ..Default::default()
+                }),
+                mime::VIDEO => AttachmentInfo::Video(BaseVideoInfo {
+                    size,
+                    ..Default::default()
+                }),
+                _ => AttachmentInfo::File(BaseFileInfo { size }),
             };
             let mut config = AttachmentConfig::new()
-                .info(AttachmentInfo::Image(info))
+                .info(info)
                 .caption(p.caption.as_deref().map(TextMessageEventContent::markdown));
             if let Some(event_id) = anchor {
                 config = config.reply(Some(Reply {
@@ -1165,11 +1182,11 @@ fn image_tool(
                 }));
             }
             let note = match &p.caption {
-                Some(c) => format!("[image: {}] {c}", p.image.filename),
-                None => format!("[image: {}]", p.image.filename),
+                Some(c) => format!("[file: {}] {c}", p.file.filename),
+                None => format!("[file: {}]", p.file.filename),
             };
             let sent = room
-                .send_attachment(p.image.filename, &mime, p.image.data, config)
+                .send_attachment(p.file.filename, &mime, p.file.data, config)
                 .await?;
             let thread = thread.as_ref().map(|t| t.as_str());
             if let Err(e) = agent.record(room.room_id(), thread, "agent", &note).await {

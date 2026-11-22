@@ -33,7 +33,7 @@ pub const SUDO: &str = "/run/wrappers/bin/sudo";
 
 /// Told to a confined run: what it does not have compared to other rooms.
 pub const PROMPT_NOTE: &str = "\n\n## Your limits here\n\n\
-You run as your own Linux user and cannot read parley's files. The `image`, \
+You run as your own Linux user and cannot read parley's files. The `file`, \
 `task` and `tasks` tools do not work here. For the room's past, use the \
 `read` tool.\n";
 
